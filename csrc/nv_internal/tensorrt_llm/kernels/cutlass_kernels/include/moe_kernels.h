@@ -270,6 +270,24 @@ struct QuantParams {
     GemmInputs fc2;
   } mxfp8_mxfp4;
 
+  // MXFP8 quantization params
+  // This mode uses block scaled MXFP8 activations and MXFP8 weights.
+  //
+  // Notes:
+  // - Both activations and weights are stored as e4m3 values with per-block e8m0 scaling factors.
+  // - The per-block scaling factors for activations live in workspace (or are copied from input_sf
+  //   when input is already block-scaled).
+  struct MXFP8Inputs {
+    struct GemmInputs {
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale =
+          nullptr;                          // (experts, n, k / 32)
+      float const* global_scale = nullptr;  // (num_experts_per_node, )
+    };
+
+    GemmInputs fc1;
+    GemmInputs fc2;
+  } mxfp8;
+
   // FP4 quantization params
   struct FP4Inputs {
     struct GemmInputs {
@@ -354,6 +372,17 @@ struct QuantParams {
     QuantParams qp;
     qp.mxfp8_mxfp4.fc1 = {fc1_weight_block_scale, fc1_global_scale};
     qp.mxfp8_mxfp4.fc2 = {fc2_weight_block_scale, fc2_global_scale};
+    return qp;
+  }
+
+  static QuantParams MXFP8(
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc1_weight_block_scale,
+      float const* fc1_global_scale,  //
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale,
+      float const* fc2_global_scale) {
+    QuantParams qp;
+    qp.mxfp8.fc1 = {fc1_weight_block_scale, fc1_global_scale};
+    qp.mxfp8.fc2 = {fc2_weight_block_scale, fc2_global_scale};
     return qp;
   }
 
@@ -549,6 +578,12 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_w4afp8 =
       std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
   static constexpr bool use_fp8_input = std::is_same_v<InputType, __nv_fp8_e4m3>;
+  // MXFP8: block-scaled FP8 (e4m3) with per-block e8m0 scaling factors (Blackwell-only).
+  //
+  // Note: This is used to size workspace for the (mxfp8@mxfp8) mode. Runtime dispatch still
+  // decides whether MXFP8 is actually enabled via QuantParams.
+  static constexpr bool use_mxfp8 =
+      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
   static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>,
                 "Current logic requires backbone type to be >=16-bits");
   static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>,
@@ -556,6 +591,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #else
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
+  static constexpr bool use_mxfp8 = false;
 #endif
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 #if defined(ENABLE_FP4)
@@ -574,7 +610,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp4 = false;
 #endif
 
-  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
+  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || use_mxfp8;
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
@@ -865,9 +901,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   // TODO: This should eventually take the quant params to give more flexibility
   static auto getScalingType() {
-    return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-           : use_fp4    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                        : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+    return (use_wfp4afp8 || use_mxfp8)
+               ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+           : use_fp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                     : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }
 
   bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size,
