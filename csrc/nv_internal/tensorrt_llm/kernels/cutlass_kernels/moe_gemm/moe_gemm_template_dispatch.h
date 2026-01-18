@@ -937,13 +937,13 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     size_t max_size = 0;
     bool has_config = false;
     for (auto conf : configs) {
-#define CALC_SIZE_FUSION(FUSION)                                                                 \
+#define CALC_SIZE_FUSION_SCALING(FUSION, SCALING_TYPE)                                           \
   do {                                                                                           \
     try {                                                                                        \
       size_t size =                                                                              \
           cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecialized<T, WeightType, OutputType, \
                                                                       FUSION>(                   \
-              num_experts, conf, multi_processor_count_, fpX_block_scaling_type);                \
+              num_experts, conf, multi_processor_count_, SCALING_TYPE);                          \
       max_size = std::max(max_size, size);                                                       \
       has_config = true;                                                                         \
     } catch (tensorrt_llm::common::TllmException const& e) {                                     \
@@ -952,12 +952,25 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     }                                                                                            \
   } while (0)
 
-      CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+      CALC_SIZE_FUSION_SCALING(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                               fpX_block_scaling_type);
+#if defined(ENABLE_FP8)
+      if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>) {
+        // MXFP8@MXFP8 is supported on SM100+. For workspace sizing, take the max of:
+        // - regular FP8 (no block scaling): fpX_block_scaling_type == NONE
+        // - MXFP8 (block scaled): fpX_block_scaling_type == MXFPX
+        if (sm_ >= 100) {
+          CALC_SIZE_FUSION_SCALING(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                                   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+        }
+      }
+#endif
       if (sm_ == 90) {
-        CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
+        CALC_SIZE_FUSION_SCALING(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,
+                                 fpX_block_scaling_type);
       }
 
-#undef CALC_SIZE_FUSION
+#undef CALC_SIZE_FUSION_SCALING
     }
     TLLM_CHECK_WITH_INFO(has_config, "Could not find valid config when calculating workspace size");
     return max_size;

@@ -781,6 +781,12 @@ def cutlass_fused_moe(
             - gemm2 dequant scale
             - gemm1 input dequant scale
 
+        MXFP8@MXFP8:
+            - gemm1 weights block scales (packed int32)
+            - gemm1 weights global scale (float32, per-expert)
+            - gemm2 weights block scales (packed int32)
+            - gemm2 weights global scale (float32, per-expert)
+
     fc1_expert_biases : Optional[torch.Tensor]
         GEMM1 biases for each expert.
 
@@ -877,6 +883,13 @@ def cutlass_fused_moe(
         elif not is_cuda_version_at_least("12.8"):
             raise NotImplementedError(
                 "FP8 block scaling not implemented for CUDA 12.6 or lower."
+            )
+
+    if use_mxfp8_act_scaling:
+        # MXFP8 (block-scaled FP8) is only supported on Blackwell (SM100+) in CUTLASS fused MoE.
+        if major < 10:
+            raise NotImplementedError(
+                "MXFP8 activation scaling is only supported on SM100+."
             )
 
     if enable_pdl is None:

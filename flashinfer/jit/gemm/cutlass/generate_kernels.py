@@ -746,6 +746,14 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
+    # SM120 (Blackwell) grouped GEMM kernels.
+    #
+    # We include:
+    # - FP4 (e2m1) for NVFP4/MXFP4 paths
+    # - FP8xFP4 (e4m3 x e2m1) for WFP4AFP8 paths
+    #
+    # Note: FP8xFP8 kernels are currently not generated for SM120 in this generator. MXFP8@MXFP8
+    # support is handled on SM100/SM10x.
     supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
@@ -914,30 +922,44 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                weight_type,
-                otype,
-                otype,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
-                dynamic_cga=dynamic_cga,
-                swap_ab=swap_ab,
+            # For SM100/SM10x we need both:
+            # - regular FP8xFP8 (non-block-scaled) kernels for FP8 quantization
+            # - MXFPX (block-scaled) FP8xFP8 kernels for MXFP8@MXFP8
+            #
+            # We encode MXFPX instantiations via `is_mx_fpx=True` which maps to the `MXFPX_`
+            # template parameter in `INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM`.
+            need_dual_fp8_fp8 = dtype == DataType.e4m3 and weight_type == DataType.e4m3
+            is_mxfpx_variants = (
+                [False, True]
+                if need_dual_fp8_fp8
+                else [dtype == DataType.e4m3 and weight_type == e2m1]
             )
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+            for is_mx_fpx in is_mxfpx_variants:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    weight_type,
+                    otype,
+                    otype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    is_mx_fpx=is_mx_fpx,
+                    dynamic_cga=dynamic_cga,
+                    swap_ab=swap_ab,
+                )
+
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 

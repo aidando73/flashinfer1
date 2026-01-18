@@ -1297,6 +1297,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                   quant_params.fp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp4);
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{}, quant_params.mxfp8);
 
   assert(gemm_m <= INT32_MAX);
   assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
@@ -1585,9 +1586,11 @@ void expandInputRowsKernelLauncher(
     // Always MXFP8
     if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                   !std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
-      TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale || prequant_scales,
-                           "MXFP8xMXFP4 block scaling or prequant_scales or prequant_scales "
-                           "parameters not provided");
+      TLLM_CHECK_WITH_INFO(
+          quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+              quant_params.mxfp8.fc1.weight_block_scale || prequant_scales,
+          "MXFP8 block scaling (MXFP8@MXFP4 or MXFP8@MXFP8) or prequant_scales parameters not "
+          "provided");
       return prequant_scales
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
@@ -1600,7 +1603,8 @@ void expandInputRowsKernelLauncher(
     else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                        std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
       TLLM_CHECK_WITH_INFO(!prequant_scales, "FP8 is not supported for AWQ");
-      return quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+      return (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+              quant_params.mxfp8.fc1.weight_block_scale)
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
@@ -2329,7 +2333,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                            "NVFP4 block scaling is expected for FP4xFP4");
       return fn(NVFP4);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return quant_params.mxfp8_mxfp4.fc2.weight_block_scale ? fn(MXFPX) : fn(NONE);
+      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+              quant_params.mxfp8.fc2.weight_block_scale)
+                 ? fn(MXFPX)
+                 : fn(NONE);
     } else
 #endif
     {
@@ -3587,14 +3594,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
-  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale) {
+  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+      quant_params.mxfp8.fc1.weight_block_scale) {
     TLLM_CHECK_WITH_INFO(
         hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Hidden size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Hidden size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)hidden_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
     TLLM_CHECK_WITH_INFO(
         inter_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Inter size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Inter size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)inter_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
   } else {
     // For NoSmem epilogue schedule, we need to align the output of the GEMM to 256 bits, for gated
@@ -3652,15 +3660,30 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
         "FP8 scales are provided for integer quantization");
   } else if (fp8_scales_required && !use_deepseek_fp8_block_scale) {
-    TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
-                         "FP8 scales expected but dequant scale for FC1 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
+    bool const is_mxfp8 = quant_params.mxfp8.fc1.weight_block_scale != nullptr;
+    if (is_mxfp8) {
+      TLLM_CHECK_WITH_INFO(quant_params.mxfp8.fc1.weight_block_scale != nullptr &&
+                               quant_params.mxfp8.fc2.weight_block_scale != nullptr,
+                           "MXFP8 scales expected but weight block scales are null");
+      TLLM_CHECK_WITH_INFO(quant_params.mxfp8.fc1.global_scale != nullptr &&
+                               quant_params.mxfp8.fc2.global_scale != nullptr,
+                           "MXFP8 scales expected but global scales are null");
+      TLLM_CHECK_WITH_INFO(
+          fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
+          "FP8 tensor scales are provided for MXFP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for MXFP8 quantization");
+    } else {
+      TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
+                           "FP8 scales expected but dequant scale for FC1 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
 
-    TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
-                         "Integer scales are provided for FP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for FP8 quantization");
+    }
   } else if (use_lora && use_fp8) {
     TLLM_CHECK_WITH_INFO(input_fp8_dequant != nullptr,
                          "FP8 scales expected but quant scale for input is a null pointer");
@@ -3888,13 +3911,21 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   }
 
   auto alpha_scale_flat1 = use_fp4        ? quant_params.fp4.fc1.global_scale
-                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc1.global_scale
-                           : use_fp8      ? fp8_dequant1
-                                          : nullptr;
+                           : use_wfp4afp8 ? (quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+                                                 ? quant_params.mxfp8_mxfp4.fc1.global_scale
+                                                 : quant_params.fp8_mxfp4.fc1.global_scale)
+                           : (use_mxfp8 && quant_params.mxfp8.fc1.weight_block_scale)
+                               ? quant_params.mxfp8.fc1.global_scale
+                           : use_fp8 ? fp8_dequant1
+                                     : nullptr;
   auto alpha_scale_flat2 = use_fp4        ? quant_params.fp4.fc2.global_scale
-                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
-                           : use_fp8      ? fp8_dequant2
-                                          : nullptr;
+                           : use_wfp4afp8 ? (quant_params.mxfp8_mxfp4.fc2.weight_block_scale
+                                                 ? quant_params.mxfp8_mxfp4.fc2.global_scale
+                                                 : quant_params.fp8_mxfp4.fc2.global_scale)
+                           : (use_mxfp8 && quant_params.mxfp8.fc2.weight_block_scale)
+                               ? quant_params.mxfp8.fc2.global_scale
+                           : use_fp8 ? fp8_dequant2
+                                     : nullptr;
   if (!alpha_scale_flat1 && !alpha_scale_flat2) {
     layout_info1.alpha_scale_ptr_array = nullptr;
     layout_info2.alpha_scale_ptr_array = nullptr;
@@ -3905,8 +3936,14 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   layout_info1.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
   layout_info2.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
 
-  layout_info1.fpX_block_scaling_type = getScalingType();
-  layout_info2.fpX_block_scaling_type = getScalingType();
+  auto runtime_fpX_block_scaling_type =
+      use_fp4        ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+      : use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+      : (use_mxfp8 && quant_params.mxfp8.fc1.weight_block_scale)
+          ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+          : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+  layout_info1.fpX_block_scaling_type = runtime_fpX_block_scaling_type;
+  layout_info2.fpX_block_scaling_type = runtime_fpX_block_scaling_type;
 
   int const threads = std::min(1024, num_experts_per_node);
   int const blocks = (num_experts_per_node + threads - 1) / threads;
