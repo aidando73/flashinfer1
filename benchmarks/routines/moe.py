@@ -205,11 +205,12 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4", "mxfp8_mxfp4"],
+        choices=["base", "fp8", "nvfp4", "mxfp8_mxfp4", "mxfp8_mxfp8"],
         help=(
             "Variant for cutlass_fused_moe benchmark: "
             "base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale), "
-            "mxfp8_mxfp4 (MXFP8 activations + MXFP4 weights)"
+            "mxfp8_mxfp4 (MXFP8 activations + MXFP4 weights), "
+            "mxfp8_mxfp8 (MXFP8 activations + MXFP8 weights)"
         ),
     )
     parser.add_argument(
@@ -1212,6 +1213,70 @@ def testCutlassFusedMoe(args):
             x_mxfp8_sf,
             out,
         )
+    elif variant == "mxfp8_mxfp8":
+        # MXFP8 activations + MXFP8 weights
+        # Mirrors tests in flashinfer/tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_mxfp8_mxfp8
+        local_num_experts = w31_local.shape[0]
+        k = hidden_size
+        n_local = w2_local.shape[2]  # local intermediate size after TP
+
+        # Quantize activations to MXFP8 (FP8 values + separate scale factors)
+        x_mxfp8, x_mxfp8_sf = mxfp8_quantize(x, True, 32)
+
+        # Quantize weights to MXFP8 and compute block-scale factors (swizzled) for MXFPX.
+        # Quantize GEMM1 weights: [E, 2*n_local, k] by flattening to [-1, k]
+        mxfp8_w31, mxfp8_w31_sf = mxfp8_quantize(w31_local.view(-1, k), True, 32)
+        mxfp8_w31 = mxfp8_w31.view(local_num_experts, 2 * n_local, k)
+        mxfp8_w31_sf = mxfp8_w31_sf.view(torch.int32).view(local_num_experts, 2 * n_local, -1)
+
+        # Quantize GEMM2 weights: [E, k, n_local] by flattening to [-1, n_local]
+        mxfp8_w2, mxfp8_w2_sf = mxfp8_quantize(w2_local.view(-1, n_local), True, 32)
+        mxfp8_w2 = mxfp8_w2.view(local_num_experts, k, n_local)
+        mxfp8_w2_sf = mxfp8_w2_sf.view(torch.int32).view(local_num_experts, k, -1)
+
+        fake_input_scale = torch.ones(local_num_experts, device=device)
+        quant_scales = [
+            mxfp8_w31_sf,
+            fake_input_scale,
+            mxfp8_w2_sf,
+            fake_input_scale,
+        ]
+
+        def run_cutlass(
+            x_mxfp8,
+            selected_experts,
+            routing_weights,
+            mxfp8_w31,
+            mxfp8_w2,
+            x_mxfp8_sf,
+            out,
+        ):
+            return cutlass_fused_moe(
+                x_mxfp8,
+                selected_experts.to(torch.int),
+                routing_weights,
+                mxfp8_w31.contiguous(),
+                mxfp8_w2.contiguous(),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                input_sf=x_mxfp8_sf,
+                use_mxfp8_act_scaling=True,
+                output=out,
+            )
+
+        input_args_for_bench = (
+            x_mxfp8,
+            selected_experts,
+            routing_weights,
+            mxfp8_w31,
+            mxfp8_w2,
+            x_mxfp8_sf,
+            out,
+        )
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
@@ -1219,7 +1284,7 @@ def testCutlassFusedMoe(args):
 
     # Optional reference check (correctness)
     if getattr(args, "refcheck", False):
-        if variant == "mxfp8_mxfp4":
+        if variant in ("mxfp8_mxfp4", "mxfp8_mxfp8"):
             # Run kernel once and validate output tensor.
             out.zero_()
             run_cutlass(*input_args_for_bench)
