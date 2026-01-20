@@ -903,6 +903,12 @@ def mxfp4_dequantize(a_fp4, a_sf):
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
     """
+    # Fast path: pure PyTorch CUDA implementation to avoid CPU roundtrips in refchecks.
+    # MXFP4 uses UE8M0 (ufp8_type=0) scales with sf_vec_size=32 and swizzled SF layout.
+    if a_fp4.is_cuda and a_sf.is_cuda:
+        return _mxfp4_dequantize_cuda_torch(a_fp4, a_sf, group_size=32)
+
+    # Fallback: existing CPU path (uses a compiled host op).
     return e2m1_and_ufp8sf_scale_to_float(
         a_fp4.cpu().view(torch.uint8),
         a_sf.cpu().view(torch.uint8).reshape(-1),

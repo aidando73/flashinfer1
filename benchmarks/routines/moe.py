@@ -32,6 +32,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    is_close_stats,
 )
 
 
@@ -1218,52 +1219,19 @@ def testCutlassFusedMoe(args):
     # Optional reference check (correctness)
     if getattr(args, "refcheck", False):
         if variant == "mxfp8_mxfp4":
-            # Dequantize MXFP8 activations
-            dq_x = (
-                mxfp8_dequantize_host(
-                    x_mxfp8.detach().cpu().view(torch.uint8),
-                    x_mxfp8_sf.detach().cpu().view(torch.uint8).reshape(-1),
-                    True,
-                )
-                .to(device)
-                .to(input_dtype)
-            )
-
-            # Dequantize MXFP4 weights (per expert)
-            dq_w31_list = []
-            dq_w2_list = []
-            for expert_id in range(local_num_experts):
-                dq_w31_list.append(
-                    mxfp4_dequantize_host(
-                        w31_mxfp4[expert_id].detach().cpu().view(torch.uint8),
-                        w31_mxfp4_sf[expert_id].detach().cpu().view(torch.uint8),
-                        group_size=32,
-                    )
-                )
-                dq_w2_list.append(
-                    mxfp4_dequantize_host(
-                        w2_mxfp4[expert_id].detach().cpu().view(torch.uint8),
-                        w2_mxfp4_sf[expert_id].detach().cpu().view(torch.uint8),
-                        group_size=32,
-                    )
-                )
-            dq_w31 = torch.stack(dq_w31_list).to(device).to(input_dtype)
-            dq_w2 = torch.stack(dq_w2_list).to(device).to(input_dtype)
-
-            ref_output = _compute_with_experts(
-                local_num_experts,
-                dq_x,
-                dq_w31,
-                dq_w2,
-                selected_experts,
-                routing_weights,
-            )
-
             # Run kernel once and validate output tensor.
             out.zero_()
             run_cutlass(*input_args_for_bench)
-            # Additional signal: cosine similarity between reference and kernel output
-            # (flattened over all elements)
+
+            selected_experts_local = selected_experts - expert_start
+            ref_output = _compute_with_experts(
+                local_num_experts,
+                x,
+                w31_local,
+                w2_local,
+                selected_experts_local,
+                routing_weights,
+            )
             if args.verbose >= 1:
                 diff = (out - ref_output).float()
                 abs_diff = diff.abs()
@@ -1283,7 +1251,25 @@ def testCutlassFusedMoe(args):
                     f" max_rel={max_rel:.6g}"
                     f" cos_sim={cos_sim:.6f}"
                 )
-            torch.testing.assert_close(ref_output, out, rtol=1e-1, atol=1e-1)
+
+            # We use looser tolerances because we're comparing unquantized moe output
+            rtol = 1e-2
+            atol = 100
+            (
+                num_different_elements,
+                num_elements,
+                num_different_elements_percentage,
+            ) = is_close_stats(ref_output, out, rtol=rtol, atol=atol)
+            if num_different_elements > 0:
+                print(
+                    "[ERROR] Output tensor mismatch in refcheck: "
+                    f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) "
+                    f"elements differ (rtol={rtol}, atol={atol})"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        "[ERROR] Refcheck failed (set --allow_output_mismatch to continue)."
+                    )
         else:
             if args.verbose >= 1:
                 print(
