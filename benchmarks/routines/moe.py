@@ -33,6 +33,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     filter_backends_by_compute_capability,
     is_close_stats,
+    is_close_cos_sim,
 )
 
 
@@ -1252,19 +1253,13 @@ def testCutlassFusedMoe(args):
                     f" cos_sim={cos_sim:.6f}"
                 )
 
-            # We use looser tolerances because we're comparing unquantized moe output
-            rtol = 1e-2
-            atol = 100
-            (
-                num_different_elements,
-                num_elements,
-                num_different_elements_percentage,
-            ) = is_close_stats(ref_output, out, rtol=rtol, atol=atol)
-            if num_different_elements > 0:
+            # Prefer cosine similarity for quantized sanity checks.
+            cos_sim_threshold = 0.9
+            cos_sim, cos_ok = is_close_cos_sim(ref_output, out, min_cos_sim=cos_sim_threshold)
+            if not cos_ok:
                 print(
-                    "[ERROR] Output tensor mismatch in refcheck: "
-                    f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) "
-                    f"elements differ (rtol={rtol}, atol={atol})"
+                    "[ERROR] Refcheck cosine similarity below threshold: "
+                    f"cos_sim={cos_sim:.6f} < {cos_sim_threshold}"
                 )
                 if not args.allow_output_mismatch:
                     raise AssertionError(

@@ -142,6 +142,22 @@ def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
     )
 
 
+def is_close_cos_sim(input, other, min_cos_sim: float = 0.97, eps: float = 1e-8):
+    """
+    Compare tensors using cosine similarity (common for quantized outputs).
+
+    Returns:
+        (cos_sim: float, is_close: bool)
+    """
+    cos_sim = torch.nn.functional.cosine_similarity(
+        input.float().flatten(),
+        other.float().flatten(),
+        dim=0,
+        eps=eps,
+    ).item()
+    return cos_sim, (cos_sim >= min_cos_sim)
+
+
 def dtype_str_to_torch_dtype(dtype_str):
     if dtype_str == "bfloat16":
         return torch.bfloat16
