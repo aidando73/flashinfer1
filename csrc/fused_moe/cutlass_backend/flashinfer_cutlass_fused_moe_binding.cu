@@ -1025,7 +1025,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(quant_scales.has_value())
           << "Expecting quant scales for W4A8_MXFP4_MXFP8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
-          << "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
+      "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
 
       TensorView fc1_weight_block = quant_scales.value()[0];
       TensorView fc1_global = quant_scales.value()[1];

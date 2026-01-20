@@ -20,8 +20,6 @@ from flashinfer import (
     shuffle_matrix_a,
     mxfp4_quantize,
     mxfp8_quantize,
-    mxfp4_dequantize_host,
-    mxfp8_dequantize_host,
 )
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -32,7 +30,6 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
-    is_close_stats,
     is_close_cos_sim,
 )
 
