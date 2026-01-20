@@ -1220,8 +1220,9 @@ def testCutlassFusedMoe(args):
         k = hidden_size
         n_local = w2_local.shape[2]  # local intermediate size after TP
 
-        # Quantize activations to MXFP8 (FP8 values + separate scale factors)
         x_mxfp8, x_mxfp8_sf = mxfp8_quantize(x, True, 32)
+        input_acts = x_mxfp8
+        input_sf = x_mxfp8_sf
 
         # Quantize weights to MXFP8 and compute block-scale factors (swizzled) for MXFPX.
         # Quantize GEMM1 weights: [E, 2*n_local, k] by flattening to [-1, k]
@@ -1234,25 +1235,22 @@ def testCutlassFusedMoe(args):
         mxfp8_w2 = mxfp8_w2.view(local_num_experts, k, n_local)
         mxfp8_w2_sf = mxfp8_w2_sf.view(torch.int32).view(local_num_experts, k, -1)
 
-        fake_input_scale = torch.ones(local_num_experts, device=device)
         quant_scales = [
             mxfp8_w31_sf,
-            fake_input_scale,
             mxfp8_w2_sf,
-            fake_input_scale,
         ]
 
         def run_cutlass(
-            x_mxfp8,
+            input_acts,
             selected_experts,
             routing_weights,
             mxfp8_w31,
             mxfp8_w2,
-            x_mxfp8_sf,
+            input_sf,
             out,
         ):
             return cutlass_fused_moe(
-                x_mxfp8,
+                input_acts,
                 selected_experts.to(torch.int),
                 routing_weights,
                 mxfp8_w31.contiguous(),
@@ -1263,18 +1261,18 @@ def testCutlassFusedMoe(args):
                 ep_size=ep_size,
                 ep_rank=ep_rank,
                 quant_scales=quant_scales,
-                input_sf=x_mxfp8_sf,
+                input_sf=input_sf,
                 use_mxfp8_act_scaling=True,
                 output=out,
             )
 
         input_args_for_bench = (
-            x_mxfp8,
+            input_acts,
             selected_experts,
             routing_weights,
             mxfp8_w31,
             mxfp8_w2,
-            x_mxfp8_sf,
+            input_sf,
             out,
         )
     else:

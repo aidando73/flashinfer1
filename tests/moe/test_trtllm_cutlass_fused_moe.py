@@ -1390,13 +1390,9 @@ def test_moe_mxfp8_mxfp8(
     router_logits = torch.randn(m, e, dtype=otype).cuda()
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    fake_input_scale = torch.ones(e, device=x.device)
-
     quant_scales = [
         mxfp8_w1_sf,
-        fake_input_scale,
         mxfp8_w2_sf,
-        fake_input_scale,
     ]
 
     flash_output = torch.zeros_like(x)

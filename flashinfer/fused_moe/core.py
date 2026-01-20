@@ -781,6 +781,10 @@ def cutlass_fused_moe(
             - gemm2 dequant scale
             - gemm1 input dequant scale
 
+        MXFP8_MXFP8 (use_mxfp8_act_scaling=True):
+            - gemm1 weights block scales (int32 view of packed scale tensor)
+            - gemm2 weights block scales (int32 view of packed scale tensor)
+
     fc1_expert_biases : Optional[torch.Tensor]
         GEMM1 biases for each expert.
 
