@@ -1284,56 +1284,76 @@ def testCutlassFusedMoe(args):
 
     # Optional reference check (correctness)
     if getattr(args, "refcheck", False):
-        if variant in ("mxfp8_mxfp4", "mxfp8_mxfp8"):
-            # Run kernel once and validate output tensor.
-            out.zero_()
-            run_cutlass(*input_args_for_bench)
+        # Benchmark-style refcheck: compare against original (pre-quant) reference and gate on cosine similarity.
+        # This intentionally includes quantization error for quantized variants.
+        out.zero_()
+        run_cutlass(*input_args_for_bench)
 
-            selected_experts_local = selected_experts - expert_start
-            ref_output = _compute_with_experts(
-                local_num_experts,
-                x,
-                w31_local,
-                w2_local,
-                selected_experts_local,
-                routing_weights,
+        local_num_experts = w31_local.shape[0]
+
+        # Note: when EP is enabled, `w31_local/w2_local` cover only a shard of experts.
+        # Remap global expert ids into local ids by subtracting `expert_start`.
+        selected_experts_local = selected_experts - expert_start
+        # If EP is enabled, some tokens may route to non-local experts. For a local-only reference,
+        # zero-out those contributions.
+        valid_mask = (selected_experts_local >= 0) & (selected_experts_local < local_num_experts)
+        routing_weights_local = routing_weights.clone()
+        routing_weights_local[~valid_mask] = 0.0
+        selected_experts_local = selected_experts_local.clone()
+        selected_experts_local[~valid_mask] = 0
+        ref_output = _compute_with_experts(
+            local_num_experts,
+            x,
+            w31_local,
+            w2_local,
+            selected_experts_local,
+            routing_weights_local,
+        )
+
+        if args.verbose >= 1:
+            diff = (out - ref_output).float()
+            abs_diff = diff.abs()
+            max_abs = abs_diff.max().item()
+            mean_abs = abs_diff.mean().item()
+            max_rel = (abs_diff / (ref_output.float().abs() + 1e-8)).max().item()
+            cos_sim = F.cosine_similarity(
+                ref_output.float().flatten(),
+                out.float().flatten(),
+                dim=0,
+                eps=1e-8,
+            ).item()
+            print(
+                "[REFCHECK] diff stats:"
+                f" max_abs={max_abs:.6g}"
+                f" mean_abs={mean_abs:.6g}"
+                f" max_rel={max_rel:.6g}"
+                f" cos_sim={cos_sim:.6f}"
             )
-            if args.verbose >= 1:
-                diff = (out - ref_output).float()
-                abs_diff = diff.abs()
-                max_abs = abs_diff.max().item()
-                mean_abs = abs_diff.mean().item()
-                max_rel = (abs_diff / (ref_output.float().abs() + 1e-8)).max().item()
-                cos_sim = F.cosine_similarity(
-                    ref_output.float().flatten(),
-                    out.float().flatten(),
-                    dim=0,
-                    eps=1e-8,
-                ).item()
-                print(
-                    "[REFCHECK] diff stats:"
-                    f" max_abs={max_abs:.6g}"
-                    f" mean_abs={mean_abs:.6g}"
-                    f" max_rel={max_rel:.6g}"
-                    f" cos_sim={cos_sim:.6f}"
-                )
 
-            # Prefer cosine similarity for quantized sanity checks.
-            cos_sim_threshold = 0.9
-            cos_sim, cos_ok = is_close_cos_sim(ref_output, out, min_cos_sim=cos_sim_threshold)
-            if not cos_ok:
-                print(
-                    "[ERROR] Refcheck cosine similarity below threshold: "
-                    f"cos_sim={cos_sim:.6f} < {cos_sim_threshold}"
-                )
-                if not args.allow_output_mismatch:
-                    raise AssertionError(
-                        "[ERROR] Refcheck failed (set --allow_output_mismatch to continue)."
-                    )
-        else:
-            if args.verbose >= 1:
-                print(
-                    f"[INFO] Refcheck is not implemented for cutlass_variant={variant}; skipping."
+        # Prefer cosine similarity for quantized sanity checks.
+        # Use per-implementation thresholds since different quant modes have different expected error.
+        cos_sim_threshold_by_variant = {
+            # Unquantized path should be extremely close.
+            "base": 0.999,
+            # Per-tensor FP8 (includes quant error)
+            "fp8": 0.97,
+            # NVFP4 weights / optional input quant (more error)
+            "nvfp4": 0.90,
+            # MXFP8 activations + MXFP4 weights
+            "mxfp8_mxfp4": 0.90,
+            # MXFP8 activations + MXFP8 weights (wiring may be partial today)
+            "mxfp8_mxfp8": 0.90,
+        }
+        cos_sim_threshold = cos_sim_threshold_by_variant[variant]
+        cos_sim, cos_ok = is_close_cos_sim(ref_output, out, min_cos_sim=cos_sim_threshold)
+        if not cos_ok:
+            print(
+                "[ERROR] Refcheck cosine similarity below threshold: "
+                f"cos_sim={cos_sim:.6f} < {cos_sim_threshold}"
+            )
+            if not args.allow_output_mismatch:
+                raise AssertionError(
+                    "[ERROR] Refcheck failed (set --allow_output_mismatch to continue)."
                 )
 
     # Optional autotune warmup (supported for CUTLASS fused MoE)
