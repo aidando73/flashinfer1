@@ -145,7 +145,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
 #ifdef ENABLE_FP8
-    if (isFp8Quant()) {
+    if (isFp8Quant() || isMxfp8Quant()) {
+      // NOTE: MXFP8 (FP8 + block-scale metadata) currently reuses the FP8 runner.
+      // The actual MXFP8 behavior is controlled via the quant params / metadata passed at runtime.
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
     }
 #endif
@@ -215,6 +217,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
+    // printf("mKernelRunner: %p\n", mKernelRunner.get());
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)
           << "Could not construct fused moe op with the requested input combination Activation: "

@@ -3587,14 +3587,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
-  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale) {
+  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale || 
+      quant_params.mxfp8.fc1.weight_block_scale) {
     TLLM_CHECK_WITH_INFO(
         hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Hidden size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Hidden size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)hidden_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
     TLLM_CHECK_WITH_INFO(
         inter_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Inter size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Inter size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)inter_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
   } else {
     // For NoSmem epilogue schedule, we need to align the output of the GEMM to 256 bits, for gated
@@ -3652,6 +3653,17 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
         "FP8 scales are provided for integer quantization");
   } else if (fp8_scales_required && !use_deepseek_fp8_block_scale) {
+    bool const is_mxfp8 = quant_params.mxfp8.fc1.weight_block_scale != nullptr;
+    if (is_mxfp8) {
+      TLLM_CHECK_WITH_INFO(quant_params.mxfp8.fc1.weight_block_scale != nullptr &&
+                               quant_params.mxfp8.fc2.weight_block_scale != nullptr,
+                           "MXFP8 scales expected but weight block scales are null");
+      TLLM_CHECK_WITH_INFO(
+          fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
+          "FP8 tensor scales are provided for MXFP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for MXFP8 quantization");
+    } else {
     TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
                          "FP8 scales expected but dequant scale for FC1 is a null pointer");
     TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
@@ -3661,6 +3673,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
                          "Integer scales are provided for FP8 quantization");
+    }
   } else if (use_lora && use_fp8) {
     TLLM_CHECK_WITH_INFO(input_fp8_dequant != nullptr,
                          "FP8 scales expected but quant scale for input is a null pointer");
