@@ -866,8 +866,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (isMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for MXFP8 quantization";
-      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
-          << "Expecting 4 quant scales for MXFP8 quantization";
+      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 2)
+          << "Expecting 2 quant scales for MXFP8 quantization";
 
       TensorView fc1_weight_block = quant_scales.value()[0];
       TensorView fc2_weight_block = quant_scales.value()[1];
