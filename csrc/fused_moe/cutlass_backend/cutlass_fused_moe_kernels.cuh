@@ -3041,6 +3041,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                                                                 /*use_fused_moe*/ false,
                                                                 stream,
                                                                 config};
+
+    printf("using_tma_ws_gemm1...");
     gemm_runner.moeGemm(universal_input, tma_ws_input);
 
     sync_check_cuda_error(stream);
@@ -3061,6 +3063,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc2_fp4_act_flat, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
+
   } else if (use_fp8) {
     TLLM_CHECK(!use_ampere_activation_fusion);
     TLLM_CHECK(!config.is_tma_warp_specialized);
@@ -3089,6 +3092,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         /*use_fused_moe*/ false,
         stream,
         config};
+    printf("gemm1 occuring use_fp8...");
     gemm_runner.moeGemm(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
@@ -3131,6 +3135,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         /*use_fused_moe*/ false,
         stream,
         config};
+    printf("is_gated_activation...");
     gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     sync_check_cuda_error(stream);
@@ -3171,6 +3176,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         use_ampere_activation_fusion,
         stream,
         config};
+    printf("gemm1 occuring use_ampere_activation_fusion...");
     gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     sync_check_cuda_error(stream);
@@ -3587,7 +3593,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
-  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale || 
+  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
       quant_params.mxfp8.fc1.weight_block_scale) {
     TLLM_CHECK_WITH_INFO(
         hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
@@ -3664,15 +3670,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
       TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
                            "Integer scales are provided for MXFP8 quantization");
     } else {
-    TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
-                         "FP8 scales expected but dequant scale for FC1 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
+                           "FP8 scales expected but dequant scale for FC1 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
 
-    TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
-                         "Integer scales are provided for FP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for FP8 quantization");
     }
   } else if (use_lora && use_fp8) {
     TLLM_CHECK_WITH_INFO(input_fp8_dequant != nullptr,
@@ -3810,6 +3816,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     sync_check_cuda_error(stream);
 
+    printf("setupTmaWarpSpecializedInputs occuring...");
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
@@ -3839,6 +3846,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
     }
     sync_check_cuda_error(stream);
+    printf("gemm1 occuring...");
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
                 glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
                 fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
@@ -3859,6 +3867,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
+    printf("gemm2 occuring...");
     Self::gemm2(
         moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
         expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,

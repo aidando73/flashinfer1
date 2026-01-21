@@ -808,7 +808,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             "Calling TMA warp specialized configuration with invalid hopper config");
 
         // Select the appropriate fusion function
-        auto select_function = [&]() {
+        printf("dispatching to sm >= 90...") auto select_function = [&]() {
           switch (hopper_inputs.fusion) {
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
               return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<
