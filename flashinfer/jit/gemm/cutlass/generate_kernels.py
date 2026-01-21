@@ -479,7 +479,9 @@ def is_op_valid(op):
 
 
 ################################################################################
-def generate_sm90_mixed_gemm_operations():
+def generate_sm90_mixed_gemm_operations(is_arch_enabled):
+    if not is_arch_enabled:
+        return []
     arch = 90
 
     # For legacy reasons, we use unsigned types for the weights. The instanitated template
@@ -728,7 +730,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
 
 def generate_sm90_operations(is_arch_enabled):
-    operations = generate_sm90_mixed_gemm_operations()
+    operations = generate_sm90_mixed_gemm_operations(is_arch_enabled)
     operations.extend(generate_sm90_grouped_gemm_operations(is_arch_enabled))
     operations.extend(generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled))
     return operations
