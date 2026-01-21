@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 from typing import List
 
 from . import env as jit_env
@@ -28,6 +29,72 @@ from .core import (
 from .cpp_ext import is_cuda_version_at_least
 from .cubin_loader import get_cubin, get_meta_hash
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
+
+
+def _parse_fused_moe_gemm_kernel_filter(filter_str: str | None) -> list[str] | None:
+    """Parse FLASHINFER_FUSED_MOE_GEMM_KERNELS.
+
+    Format: comma-separated list of moe_gemm kernel file suffixes, e.g.
+      - "fp8_fp8"
+      - "fp4_fp4,fp8_fp4"
+      - "all" / unset: no filtering
+
+    Returns:
+      - None if no filtering is requested
+      - A sorted list of unique suffixes otherwise
+    """
+    if not filter_str:
+        return None
+    tokens = [t.strip().lower() for t in filter_str.split(",") if t.strip()]
+    if not tokens or any(t == "all" for t in tokens):
+        return None
+    return sorted(set(tokens))
+
+
+def _fused_moe_static_moe_gemm_kernel_sources(
+    gemm_kernel_filter: list[str] | None,
+) -> list[str]:
+    """Return relative paths for the selected static moe_gemm kernel .cu files."""
+    kernel_dir = "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm"
+    all_kernels: dict[str, str] = {
+        "fp8_uint4": f"{kernel_dir}/moe_gemm_kernels_fp8_uint4.cu",
+        "fp8_fp8": f"{kernel_dir}/moe_gemm_kernels_fp8_fp8.cu",
+        "fp8_fp4": f"{kernel_dir}/moe_gemm_kernels_fp8_fp4.cu",
+        "fp4_fp4": f"{kernel_dir}/moe_gemm_kernels_fp4_fp4.cu",
+        "fp32_fp32": f"{kernel_dir}/moe_gemm_kernels_fp32_fp32.cu",
+        "fp16_uint8": f"{kernel_dir}/moe_gemm_kernels_fp16_uint8.cu",
+        "fp16_uint4": f"{kernel_dir}/moe_gemm_kernels_fp16_uint4.cu",
+        "fp16_fp16": f"{kernel_dir}/moe_gemm_kernels_fp16_fp16.cu",
+        "bf16_uint8": f"{kernel_dir}/moe_gemm_kernels_bf16_uint8.cu",
+        "bf16_uint4": f"{kernel_dir}/moe_gemm_kernels_bf16_uint4.cu",
+        "bf16_fp8": f"{kernel_dir}/moe_gemm_kernels_bf16_fp8.cu",
+        "bf16_bf16": f"{kernel_dir}/moe_gemm_kernels_bf16_bf16.cu",
+        "bf16_fp4": f"{kernel_dir}/moe_gemm_kernels_bf16_fp4.cu",
+        "fp16_fp4": f"{kernel_dir}/moe_gemm_kernels_fp16_fp4.cu",
+    }
+
+    if gemm_kernel_filter is None:
+        return list(all_kernels.values())
+
+    unknown = [k for k in gemm_kernel_filter if k not in all_kernels]
+    if unknown:
+        supported = ", ".join(sorted(all_kernels.keys()))
+        raise ValueError(
+            "Unknown entries in FLASHINFER_FUSED_MOE_GEMM_KERNELS: "
+            f"{unknown}. Supported: {supported} (or 'all')."
+        )
+
+    return [all_kernels[k] for k in gemm_kernel_filter]
+
+
+def _fused_moe_module_name(device_arch: str, gemm_kernel_filter: list[str] | None) -> str:
+    # Keep the cache key stable when a filter is used.
+    if gemm_kernel_filter is None:
+        return f"fused_moe_{device_arch}"
+    suffix = "__".join(gemm_kernel_filter)
+    # Only allow alnum + '_' to keep paths safe/portable.
+    suffix = "".join(c if (c.isalnum() or c == "_") else "_" for c in suffix)
+    return f"fused_moe_{device_arch}_k_{suffix}"
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
@@ -111,6 +178,10 @@ def gen_cutlass_fused_moe_module(
     """
     Generate a JitSpec for the cutlass fused moe module.
     """
+    gemm_kernel_filter = _parse_fused_moe_gemm_kernel_filter(
+        # Allow a filter for development to avoid long compilation times
+        os.environ.get("FLASHINFER_FUSED_MOE_GEMM_KERNELS")
+    )
     output_dir = (
         jit_env.FLASHINFER_CSRC_DIR
         / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
@@ -123,44 +194,22 @@ def gen_cutlass_fused_moe_module(
         generate_gemm_operations(
             output_dir,
             f"{device_arch};{device_arch}-real",
+            # Filter by dtype - used for development to avoid long compilation times
+            dtype_filter=os.environ.get("FLASHINFER_CUTLASS_MOE_DTYPE_FILTER"),
         )
 
     except Exception as e:
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        f"fused_moe_{device_arch}",
+        _fused_moe_module_name(device_arch, gemm_kernel_filter),
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu",
+            *(
+                jit_env.FLASHINFER_CSRC_DIR / rel
+                for rel in _fused_moe_static_moe_gemm_kernel_sources(gemm_kernel_filter)
+            ),
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
