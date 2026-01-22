@@ -550,12 +550,13 @@ template <typename T,                         /* The type used for activations *
           typename OutputType = T,            /* The type for the MoE final output */
           typename InputType = T,             /* The type for the MoE input */
           typename BackBoneType = OutputType, /* The unquantized backbone data type of the model */
+          bool IsMXFP8 = false,               /* Whether to use MXFP8 block scaling for FP8@FP8 */
           typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using DeepSeekBlockScaleGemmRunner =
       tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
   using ScaleBiasType = BackBoneType;
-  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
+  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8>;
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
@@ -600,7 +601,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp4 = false;
 #endif
 
-  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
+  // Block scaling is used for FP4 variants and MXFP8 (when IsMXFP8=true for FP8@FP8).
+  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || IsMXFP8;
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
@@ -889,9 +891,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
   }
 
-  // TODO: This should eventually take the quant params to give more flexibility
+  // Returns the scaling type based on compile-time parameters.
+  // IsMXFP8 controls whether MXFP8 block scaling is used for FP8@FP8.
   static auto getScalingType() {
     return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+           : IsMXFP8    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
            : use_fp4    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
                         : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }

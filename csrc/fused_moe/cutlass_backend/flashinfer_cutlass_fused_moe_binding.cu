@@ -82,7 +82,7 @@ class DtypeUtils {
 
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
-  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false>
+  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFP8 = false>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
@@ -95,6 +95,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       case float16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
+        } else if constexpr (IsMXFP8) {
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct, half, true>>();
         } else {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
@@ -104,6 +107,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         if constexpr (NeedQuant) {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16>>();
+        } else if constexpr (IsMXFP8) {
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16,
+                                                              TypeAct, __nv_bfloat16, true>>();
         } else {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, TypeAct>>();
@@ -145,8 +151,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
 #ifdef ENABLE_FP8
-    if (isFp8Quant() || isMxfp8Quant()) {
-      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+    if (isFp8Quant()) {
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, false>(mOutputDtype);
+    } else if (isMxfp8Quant()) {
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, true>(mOutputDtype);
     }
 #endif
 #ifdef ENABLE_FP4
