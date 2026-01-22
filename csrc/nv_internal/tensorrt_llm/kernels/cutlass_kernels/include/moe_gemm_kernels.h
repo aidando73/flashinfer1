@@ -310,6 +310,8 @@ class MoeGemmRunner {
                                                   int gemm_k) const;
 
   size_t getMaxWorkspaceSize(int num_experts) const;
+  size_t getMaxWorkspaceSize(int num_experts,
+                             TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) const;
 
   [[nodiscard]] int getSM() const;
 
@@ -328,6 +330,9 @@ class MoeGemmRunner {
   mutable int num_experts_ = 0;
   mutable size_t gemm_workspace_size_ = 0;
   size_t calcMaxWorkspaceSize(int num_experts) const;
+  size_t calcMaxWorkspaceSize(int num_experts,
+                              TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) const;
+  TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType getDefaultScalingType() const;
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

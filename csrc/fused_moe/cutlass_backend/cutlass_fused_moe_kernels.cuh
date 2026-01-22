@@ -2622,7 +2622,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
                                                 num_experts_per_node, getScalingType())
                                           : 0;
 
-  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  // Pass scaling type to get correct workspace size for MXFP8 vs per-tensor FP8
+  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, getScalingType());
 
   // lora related
   size_t const lora_input_size =

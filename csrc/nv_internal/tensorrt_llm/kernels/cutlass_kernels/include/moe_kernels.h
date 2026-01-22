@@ -769,7 +769,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
-    return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+    return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, getScalingType());
   }
 
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
