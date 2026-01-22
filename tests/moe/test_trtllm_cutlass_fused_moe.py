@@ -1434,7 +1434,7 @@ def test_moe_mxfp8_mxfp8(
 
     dq_mxfp8_w1 = (
         mxfp8_dequantize_host(
-            mxfp8_w1.cpu().view(torch.uint8),
+            mxfp8_w1.cpu().view(torch.uint8).reshape(-1, k),
             mxfp8_w1_sf.cpu().view(torch.uint8).reshape(-1),
             True,
         )
@@ -1444,7 +1444,7 @@ def test_moe_mxfp8_mxfp8(
 
     dq_mxfp8_w2 = (
         mxfp8_dequantize_host(
-            mxfp8_w2.cpu().view(torch.uint8),
+            mxfp8_w2.cpu().view(torch.uint8).reshape(-1, n),
             mxfp8_w2_sf.cpu().view(torch.uint8).reshape(-1),
             True,
         )
