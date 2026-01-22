@@ -1012,19 +1012,15 @@ def generate_sm80_operations(is_arch_enabled):
 def _parse_dtype_filter(dtype_filter: str | None):
     """Parse a key=value filter for kernel selection.
 
-    Format: "weight=fp8,act=fp8,cta_m=64|128,cta_n=128"
+    Format: "weight=fp8,act=fp8"
 
     Supported keys:
       - weight: weight data type (fp8, bf16, fp16, fp4, etc.)
       - act: activation data type (fp8, bf16, fp16, fp4, etc.)
-      - cta_m: CTA tile M dimension (integer or pipe-separated list, e.g. 64|128)
-      - cta_n: CTA tile N dimension (integer or pipe-separated list, e.g. 128|256)
 
     Examples:
       - None / "" / "all": no filtering
       - "weight=fp8,act=fp8" - only FP8@FP8 kernels
-      - "weight=fp8,act=fp8,cta_m=128,cta_n=128" - FP8@FP8 with specific CTA shape
-      - "weight=fp8,act=fp8,cta_m=64|128" - FP8@FP8 with M=64 or M=128
 
     Notes:
       - Supports common aliases: fp16/f16, bf16, fp32/f32, fp8/e4m3, fp4/e2m1, uint4/u4, uint8/u8.
@@ -1055,10 +1051,6 @@ def _parse_dtype_filter(dtype_filter: str | None):
             return {DataType.ue8m0}
         raise ValueError(f"Unknown dtype token in dtype_filter: {name!r}")
 
-    def _int_set(value: str):
-        """Parse a pipe-separated list of integers, e.g. '64|128' -> {64, 128}"""
-        return {int(v.strip()) for v in value.split("|")}
-
     # Parse key=value pairs
     tokens = [t.strip() for t in dtype_filter.split(",") if t.strip()]
     filter_dict = {}
@@ -1076,12 +1068,6 @@ def _parse_dtype_filter(dtype_filter: str | None):
         result["act_types"] = _type_set(filter_dict["act"])
     if "weight" in filter_dict:
         result["weight_types"] = _type_set(filter_dict["weight"])
-
-    # Parse CTA shape constraints (support pipe-separated values like 64|128)
-    if "cta_m" in filter_dict:
-        result["cta_m"] = _int_set(filter_dict["cta_m"])
-    if "cta_n" in filter_dict:
-        result["cta_n"] = _int_set(filter_dict["cta_n"])
 
     return result if result else None
 
@@ -1153,16 +1139,6 @@ def generate_gemm_operations(output_dir, architectures, dtype_filter: str | None
                 continue
             if weight_types and weight is not None and weight not in weight_types:
                 continue
-
-            # Check CTA shape constraints
-            cta_shape = getattr(op, "cta_shape", None)
-            if cta_shape is not None:
-                cta_m_set = filter_spec.get("cta_m")
-                cta_n_set = filter_spec.get("cta_n")
-                if cta_m_set is not None and cta_shape[0] not in cta_m_set:
-                    continue
-                if cta_n_set is not None and cta_shape[1] not in cta_n_set:
-                    continue
 
             filtered.append(op)
 

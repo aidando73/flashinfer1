@@ -187,16 +187,6 @@ def gen_cutlass_fused_moe_module(
         / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
     )
 
-    # Build dtype_filter, appending CTA shape constraint if fast_build is enabled
-    dtype_filter = os.environ.get("FLASHINFER_CUTLASS_MOE_DTYPE_FILTER")
-    if use_fast_build:
-        # FAST_BUILD limits to 128x128x128 CTA shape - align kernel generation
-        cta_filter = "cta_m=128,cta_n=128"
-        if dtype_filter:
-            dtype_filter = f"{dtype_filter},{cta_filter}"
-        else:
-            dtype_filter = cta_filter
-
     try:
         # Create output directory if it doesn't exist
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,8 +194,8 @@ def gen_cutlass_fused_moe_module(
         generate_gemm_operations(
             output_dir,
             f"{device_arch};{device_arch}-real",
-            # Filter by dtype/shape - used for development to avoid long compilation times
-            dtype_filter=dtype_filter,
+            # Filter by dtype - used for development to avoid long compilation times
+            dtype_filter=os.environ.get("FLASHINFER_CUTLASS_MOE_DTYPE_FILTER"),
         )
 
     except Exception as e:
