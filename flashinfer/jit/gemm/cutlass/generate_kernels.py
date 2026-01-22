@@ -1010,13 +1010,21 @@ def generate_sm80_operations(is_arch_enabled):
 
 
 def _parse_dtype_filter(dtype_filter: str | None):
-    """Parse a comma-separated filter for (act_type, weight_type) pairs.
+    """Parse a key=value filter for kernel selection.
+
+    Format: "weight=fp8,act=fp8,cta_m=64|128,cta_n=128"
+
+    Supported keys:
+      - weight: weight data type (fp8, bf16, fp16, fp4, etc.)
+      - act: activation data type (fp8, bf16, fp16, fp4, etc.)
+      - cta_m: CTA tile M dimension (integer or pipe-separated list, e.g. 64|128)
+      - cta_n: CTA tile N dimension (integer or pipe-separated list, e.g. 128|256)
 
     Examples:
       - None / "" / "all": no filtering
-      - "bf16_bf16"
-      - "bf16_fp8,fp16_fp16"
-      - "fp8_fp4"
+      - "weight=fp8,act=fp8" - only FP8@FP8 kernels
+      - "weight=fp8,act=fp8,cta_m=128,cta_n=128" - FP8@FP8 with specific CTA shape
+      - "weight=fp8,act=fp8,cta_m=64|128" - FP8@FP8 with M=64 or M=128
 
     Notes:
       - Supports common aliases: fp16/f16, bf16, fp32/f32, fp8/e4m3, fp4/e2m1, uint4/u4, uint8/u8.
@@ -1024,8 +1032,7 @@ def _parse_dtype_filter(dtype_filter: str | None):
     """
     if not dtype_filter:
         return None
-    tokens = [t.strip() for t in dtype_filter.split(",") if t.strip()]
-    if not tokens or any(t.lower() == "all" for t in tokens):
+    if dtype_filter.strip().lower() == "all":
         return None
 
     def _type_set(name: str):
@@ -1048,17 +1055,35 @@ def _parse_dtype_filter(dtype_filter: str | None):
             return {DataType.ue8m0}
         raise ValueError(f"Unknown dtype token in dtype_filter: {name!r}")
 
-    allowed_pairs = set()
+    def _int_set(value: str):
+        """Parse a pipe-separated list of integers, e.g. '64|128' -> {64, 128}"""
+        return {int(v.strip()) for v in value.split("|")}
+
+    # Parse key=value pairs
+    tokens = [t.strip() for t in dtype_filter.split(",") if t.strip()]
+    filter_dict = {}
     for tok in tokens:
-        if "_" not in tok:
-            # Shorthand: "bf16" means "bf16_bf16"
-            a = b = tok
-        else:
-            a, b = tok.split("_", 1)
-        for ta in _type_set(a):
-            for tb in _type_set(b):
-                allowed_pairs.add((ta, tb))
-    return allowed_pairs
+        if "=" not in tok:
+            raise ValueError(f"Invalid filter token (expected key=value): {tok!r}")
+        key, value = tok.split("=", 1)
+        filter_dict[key.strip().lower()] = value.strip()
+
+    # Build the filter result
+    result = {}
+
+    # Parse dtype constraints
+    if "act" in filter_dict:
+        result["act_types"] = _type_set(filter_dict["act"])
+    if "weight" in filter_dict:
+        result["weight_types"] = _type_set(filter_dict["weight"])
+
+    # Parse CTA shape constraints (support pipe-separated values like 64|128)
+    if "cta_m" in filter_dict:
+        result["cta_m"] = _int_set(filter_dict["cta_m"])
+    if "cta_n" in filter_dict:
+        result["cta_n"] = _int_set(filter_dict["cta_n"])
+
+    return result if result else None
 
 
 def generate_gemm_operations(output_dir, architectures, dtype_filter: str | None = None):
@@ -1100,26 +1125,46 @@ def generate_gemm_operations(output_dir, architectures, dtype_filter: str | None
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 
-    allowed_pairs = _parse_dtype_filter(dtype_filter)
-    if allowed_pairs is not None:
+    filter_spec = _parse_dtype_filter(dtype_filter)
+    if filter_spec is not None:
         filtered = []
 
         for op in operations:
             # SM80 launcher config uses a single `dtype`.
             if isinstance(op, GemmSm80LauncherConfig):
-                if (op.dtype, op.dtype) in allowed_pairs:
-                    filtered.append(op)
+                act_types = filter_spec.get("act_types")
+                weight_types = filter_spec.get("weight_types")
+                if act_types and op.dtype not in act_types:
+                    continue
+                if weight_types and op.dtype not in weight_types:
+                    continue
+                # SM80 doesn't have cta_shape in the same way, skip CTA filtering for it
+                filtered.append(op)
                 continue
 
             # TRT-LLM style operations carry `act_type`/`weight_type`.
             act = getattr(op, "act_type", None)
             weight = getattr(op, "weight_type", None)
-            if act is None or weight is None:
-                filtered.append(op)
+
+            # Check dtype constraints
+            act_types = filter_spec.get("act_types")
+            weight_types = filter_spec.get("weight_types")
+            if act_types and act is not None and act not in act_types:
+                continue
+            if weight_types and weight is not None and weight not in weight_types:
                 continue
 
-            if (act, weight) in allowed_pairs:
-                filtered.append(op)
+            # Check CTA shape constraints
+            cta_shape = getattr(op, "cta_shape", None)
+            if cta_shape is not None:
+                cta_m_set = filter_spec.get("cta_m")
+                cta_n_set = filter_spec.get("cta_n")
+                if cta_m_set is not None and cta_shape[0] not in cta_m_set:
+                    continue
+                if cta_n_set is not None and cta_shape[1] not in cta_n_set:
+                    continue
+
+            filtered.append(op)
 
         operations = filtered
 

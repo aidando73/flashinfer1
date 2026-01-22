@@ -517,6 +517,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                       T, WeightType, EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm100) {
+#ifndef FAST_BUILD
         SHAPE_CASE(100, 64, 32, 128)
         SHAPE_CASE(100, 64, 64, 128)
         SHAPE_CASE(100, 64, 128, 128)
@@ -525,11 +526,14 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
         SHAPE_CASE(100, 128, 16, 128)
         SHAPE_CASE(100, 128, 32, 128)
         SHAPE_CASE(100, 128, 64, 128)
+#endif
         SHAPE_CASE(100, 128, 128, 128)
+#ifndef FAST_BUILD
         SHAPE_CASE(100, 128, 256, 128)
 
         // SHAPE_CASE(100, 128, 128, 64)
         // SHAPE_CASE(100, 128, 256, 64)
+#endif
         DEFAULT_CASE(100)
       }
     } else {
