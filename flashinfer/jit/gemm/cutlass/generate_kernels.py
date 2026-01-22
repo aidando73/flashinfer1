@@ -916,30 +916,43 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                weight_type,
-                otype,
-                otype,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
-                dynamic_cga=dynamic_cga,
-                swap_ab=swap_ab,
-            )
+            # Determine which is_mx_fpx variants to generate:
+            # - WFP4AFP8 (FP8@FP4): only is_mx_fpx=True
+            # - WFP8@AFP8 (FP8@FP8): both False (per-tensor) and True (block-scaled)
+            # - Others: only is_mx_fpx=False
+            if dtype == DataType.e4m3 and weight_type == e2m1:
+                mx_fpx_variants = [True]
+            elif dtype == DataType.e4m3 and weight_type == DataType.e4m3:
+                mx_fpx_variants = [False, True]  # Both per-tensor and block-scaled
+                # mx_fpx_variants = [True] # TODO - this is just for development purposes to reduce compile time - should uncomment the above when ready
+            else:
+                mx_fpx_variants = [False]
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+            for is_mx_fpx in mx_fpx_variants:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    weight_type,
+                    otype,
+                    otype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    is_mx_fpx=is_mx_fpx,
+                    dynamic_cga=dynamic_cga,
+                    swap_ab=swap_ab,
+                )
+
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 

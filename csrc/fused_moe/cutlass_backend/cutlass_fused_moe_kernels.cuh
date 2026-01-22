@@ -1297,6 +1297,8 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                   quant_params.fp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp4);
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                  quant_params.mxfp8);
 
   assert(gemm_m <= INT32_MAX);
   assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
@@ -1600,7 +1602,8 @@ void expandInputRowsKernelLauncher(
     else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                        std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
       TLLM_CHECK_WITH_INFO(!prequant_scales, "FP8 is not supported for AWQ");
-      return quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+      return (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+              quant_params.mxfp8.fc1.weight_block_scale)
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
@@ -2329,7 +2332,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                            "NVFP4 block scaling is expected for FP4xFP4");
       return fn(NVFP4);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return quant_params.mxfp8_mxfp4.fc2.weight_block_scale ? fn(MXFPX) : fn(NONE);
+      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+              quant_params.mxfp8.fc2.weight_block_scale)
+                 ? fn(MXFPX)
+                 : fn(NONE);
     } else
 #endif
     {
@@ -3929,6 +3935,12 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
   layout_info1.fpX_block_scaling_type = getScalingType();
   layout_info2.fpX_block_scaling_type = getScalingType();
+
+  // Override for MXFP8 mode: if weight block scales are provided, use MXFPX block scaling
+  if (quant_params.mxfp8.fc1.weight_block_scale) {
+    layout_info1.fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    layout_info2.fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+  }
 
   int const threads = std::min(1024, num_experts_per_node);
   int const blocks = (num_experts_per_node + threads - 1) / threads;
