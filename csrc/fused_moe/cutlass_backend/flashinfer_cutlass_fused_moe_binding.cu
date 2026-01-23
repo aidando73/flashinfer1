@@ -82,7 +82,7 @@ class DtypeUtils {
 
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
-  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false>
+  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFP8 = false>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
@@ -95,6 +95,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       case float16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
+        } else if constexpr (IsMXFP8) {
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct, half, true>>();
         } else {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
@@ -104,6 +107,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         if constexpr (NeedQuant) {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16>>();
+        } else if constexpr (IsMXFP8) {
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16,
+                                                              TypeAct, __nv_bfloat16, true>>();
         } else {
           return std::make_unique<
               kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, TypeAct>>();
@@ -146,7 +152,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
 #ifdef ENABLE_FP8
     if (isFp8Quant()) {
-      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, false>(mOutputDtype);
+    } else if (isMxfp8Quant()) {
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, true>(mOutputDtype);
     }
 #endif
 #ifdef ENABLE_FP4
@@ -490,7 +498,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.";
     }
 
-    TVM_FFI_ICHECK(!input_sf.has_value() || isWMxfp4AMxfp8Quant() || isNvfp4Quant())
+    TVM_FFI_ICHECK(!input_sf.has_value() || isWMxfp4AMxfp8Quant() || isMxfp8Quant() ||
+                   isNvfp4Quant())
         << "Block-scaling factors provided for non block-scaling quantization";
 
     int experts_per_token = token_selected_experts.size(1);
@@ -862,7 +871,64 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
       Optional<Array<Tensor>> quant_scales,
       ActivationType base_activation_type = ActivationType::Swiglu) const {
-    if (isFp8Quant()) {
+    if (isMxfp8Quant()) {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+      TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for MXFP8 quantization";
+      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 2)
+          << "Expecting 2 quant scales for MXFP8 quantization";
+
+      TensorView fc1_weight_block = quant_scales.value()[0];
+      TensorView fc2_weight_block = quant_scales.value()[1];
+
+      // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32.
+      constexpr int FP8_PER_INT32 = 4;
+      CHECK_INPUT_TYPE(fc1_weight_block, dl_int32);
+      CHECK_INPUT_TYPE(fc2_weight_block, dl_int32);
+      CHECK_DIM(3, fc1_weight_block);
+      CHECK_DIM(3, fc2_weight_block);
+
+      // Check shapes.
+      // Note: For gated activations, we store FC1's weights as [up_proj; gate_proj] (concatenated
+      // along N). The block-scale tensor uses *per-matrix* padding along N, so the expected block
+      // scale "N" dimension is:
+      //   align(inter_size) * 2
+      // instead of:
+      //   align(inter_size * 2)
+      int64_t const fc1_weight_block_n =
+          isGatedActivation(base_activation_type)
+              ? TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
+                    2
+              : TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      TVM_FFI_ICHECK(
+          fc1_weight_block.size(0) == num_experts_on_rank &&
+          fc1_weight_block.size(1) == fc1_weight_block_n &&
+          fc1_weight_block.size(2) * FP8_PER_INT32 *
+                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
+          << "fc1 weight block size must be (num_experts_on_rank, fc1_n, hidden_size // 4 // "
+             "block_scale_vector_size)";
+      TVM_FFI_ICHECK(
+          fc2_weight_block.size(0) == num_experts_on_rank &&
+          fc2_weight_block.size(1) ==
+              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) &&
+          fc2_weight_block.size(2) * FP8_PER_INT32 *
+                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
+          << "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
+             "block_scale_vector_size)";
+
+      return kernels::QuantParams::MXFP8(
+          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
+          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()));
+#else
+      TVM_FFI_ICHECK(false) << "MXFP8 quantization is not supported in non-OSS Cutlass Moe Gemm";
+#endif
+    } else if (isFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for fp8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
           << "Expecting 4 quant scales for fp8 quantization";
@@ -1168,7 +1234,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   bool isFp8Quant() const {
     return !mUseDeepSeekFP8BlockScaling && mActivationDtype == dl_float8_e4m3fn &&
-           mWeightDtype == dl_float8_e4m3fn;
+           mWeightDtype == dl_float8_e4m3fn && !mUseMxfp8ActScaling;
+  }
+
+  bool isMxfp8Quant() const {
+    return !mUseDeepSeekFP8BlockScaling && mActivationDtype == dl_float8_e4m3fn &&
+           mWeightDtype == dl_float8_e4m3fn && mUseMxfp8ActScaling;
   }
 
   bool isNvfp4Quant() const {

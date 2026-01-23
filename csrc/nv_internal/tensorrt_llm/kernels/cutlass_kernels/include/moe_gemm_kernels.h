@@ -283,6 +283,14 @@ class MoeGemmRunner {
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
 #endif
+  // MXFP8: both activation and weight are FP8 e4m3 with block scaling
+  // This requires M=128 tile shapes on SM100 (M=64 is not supported)
+#if defined(ENABLE_FP8)
+  static constexpr bool is_mxfp8 =
+      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+#else
+  static constexpr bool is_mxfp8 = false;
+#endif
 
   void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       TmaWarpSpecializedGroupedGemmInput hopper_inputs);
@@ -310,6 +318,8 @@ class MoeGemmRunner {
                                                   int gemm_k) const;
 
   size_t getMaxWorkspaceSize(int num_experts) const;
+  size_t getMaxWorkspaceSize(
+      int num_experts, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) const;
 
   [[nodiscard]] int getSM() const;
 
@@ -328,6 +338,9 @@ class MoeGemmRunner {
   mutable int num_experts_ = 0;
   mutable size_t gemm_workspace_size_ = 0;
   size_t calcMaxWorkspaceSize(int num_experts) const;
+  size_t calcMaxWorkspaceSize(
+      int num_experts, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) const;
+  TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType getDefaultScalingType() const;
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

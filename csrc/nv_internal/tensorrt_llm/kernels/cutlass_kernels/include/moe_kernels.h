@@ -270,6 +270,23 @@ struct QuantParams {
     GemmInputs fc2;
   } mxfp8_mxfp4;
 
+  // MXFP8 quantization params
+  // This mode uses block scaled MXFP8 activations and MXFP8 weights.
+  //
+  // Notes:
+  // - Both activations and weights are stored as e4m3 values with per-block e8m0 scaling factors.
+  // - The per-block scaling factors for activations live in workspace (or are copied from input_sf
+  //   when input is already block-scaled).
+  struct MXFP8Inputs {
+    struct GemmInputs {
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale =
+          nullptr;                          // (experts, n, k / 32)
+    };
+
+    GemmInputs fc1;
+    GemmInputs fc2;
+  } mxfp8;
+
   // FP4 quantization params
   struct FP4Inputs {
     struct GemmInputs {
@@ -354,6 +371,15 @@ struct QuantParams {
     QuantParams qp;
     qp.mxfp8_mxfp4.fc1 = {fc1_weight_block_scale, fc1_global_scale};
     qp.mxfp8_mxfp4.fc2 = {fc2_weight_block_scale, fc2_global_scale};
+    return qp;
+  }
+
+  static QuantParams MXFP8(
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc1_weight_block_scale,
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale) {
+    QuantParams qp;
+    qp.mxfp8.fc1 = {fc1_weight_block_scale};
+    qp.mxfp8.fc2 = {fc2_weight_block_scale};
     return qp;
   }
 
@@ -524,12 +550,13 @@ template <typename T,                         /* The type used for activations *
           typename OutputType = T,            /* The type for the MoE final output */
           typename InputType = T,             /* The type for the MoE input */
           typename BackBoneType = OutputType, /* The unquantized backbone data type of the model */
+          bool IsMXFP8 = false,               /* Whether to use MXFP8 block scaling for FP8@FP8 */
           typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using DeepSeekBlockScaleGemmRunner =
       tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
   using ScaleBiasType = BackBoneType;
-  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
+  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8>;
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
@@ -574,7 +601,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp4 = false;
 #endif
 
-  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
+  // Block scaling is used for FP4 variants and MXFP8 (when IsMXFP8=true for FP8@FP8).
+  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || IsMXFP8;
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
@@ -741,7 +769,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
-    return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+    return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, getScalingType());
   }
 
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -863,9 +891,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
   }
 
-  // TODO: This should eventually take the quant params to give more flexibility
+  // Returns the scaling type based on compile-time parameters.
+  // IsMXFP8 controls whether MXFP8 block scaling is used for FP8@FP8.
   static auto getScalingType() {
     return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+           : IsMXFP8    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
            : use_fp4    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
                         : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }

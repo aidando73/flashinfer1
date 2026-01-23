@@ -3,6 +3,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.autotuner import autotune
@@ -14,7 +15,12 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
     convert_to_block_layout,
 )
-from flashinfer import fp4_quantize, shuffle_matrix_a
+from flashinfer import (
+    fp4_quantize,
+    shuffle_matrix_a,
+    mxfp4_quantize,
+    mxfp8_quantize,
+)
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -24,6 +30,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    is_close_cos_sim,
 )
 
 
@@ -195,8 +202,13 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4"],
-        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+        choices=["base", "fp8", "nvfp4", "mxfp8_mxfp4", "mxfp8_mxfp8"],
+        help=(
+            "Variant for cutlass_fused_moe benchmark: "
+            "base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale), "
+            "mxfp8_mxfp4 (MXFP8 activations + MXFP4 weights), "
+            "mxfp8_mxfp8 (MXFP8 activations + MXFP8 weights)"
+        ),
     )
     parser.add_argument(
         "--quantized_input",
@@ -497,6 +509,36 @@ def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
     inv_scale = 1.0 / scale
     out = (x.float() * inv_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
     return out, scale.view((1,))
+
+
+def _compute_with_experts(
+    num_experts: int,
+    x: torch.Tensor,
+    w31_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Reference MoE compute for SwiGLU: silu(x @ w1^T) * (x @ w3^T) then @ w2^T with routed accumulation.
+
+    Mirrors flashinfer/tests/moe/test_trtllm_cutlass_fused_moe.py::compute_with_experts.
+    """
+    results = torch.zeros_like(x)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        # w31 layout: [w3; w1]
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+        expert_inputs = x[batch_idx]
+        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x)
 
 
 def testTrtllmFp4BlockScaleMoe(args):
@@ -1099,10 +1141,215 @@ def testCutlassFusedMoe(args):
             w2_q,
             out,
         )
+    elif variant == "mxfp8_mxfp4":
+        # MXFP8 activations + MXFP4 weights
+        # Mirrors tests in flashinfer/tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_mxfp8_mxfp4
+        local_num_experts = w31_local.shape[0]
+
+        # Quantize activations to MXFP8 (FP8 values + separate scale factors)
+        x_mxfp8, x_mxfp8_sf = mxfp8_quantize(x, True, 32)
+
+        # Quantize weights per expert to MXFP4 (packed uint8 + scale factors)
+        w31_mxfp4_list = []
+        w31_mxfp4_sf_list = []
+        w2_mxfp4_list = []
+        w2_mxfp4_sf_list = []
+        for expert_id in range(local_num_experts):
+            w31_q, w31_sf = mxfp4_quantize(w31_local[expert_id])
+            w2_q, w2_sf = mxfp4_quantize(w2_local[expert_id].contiguous())
+            w31_mxfp4_list.append(w31_q)
+            w31_mxfp4_sf_list.append(w31_sf)
+            w2_mxfp4_list.append(w2_q)
+            w2_mxfp4_sf_list.append(w2_sf)
+
+        w31_mxfp4 = torch.stack(w31_mxfp4_list)
+        w31_mxfp4_sf = torch.stack(w31_mxfp4_sf_list)
+        w2_mxfp4 = torch.stack(w2_mxfp4_list)
+        w2_mxfp4_sf = torch.stack(w2_mxfp4_sf_list)
+
+        fake_input_scale = torch.ones(local_num_experts, device=device)
+        quant_scales = [
+            w31_mxfp4_sf.view(torch.int32),
+            fake_input_scale,
+            w2_mxfp4_sf.view(torch.int32),
+            fake_input_scale,
+        ]
+
+        def run_cutlass(
+            x_mxfp8,
+            selected_experts,
+            routing_weights,
+            w31_mxfp4,
+            w2_mxfp4,
+            x_mxfp8_sf,
+            out,
+        ):
+            return cutlass_fused_moe(
+                x_mxfp8,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_mxfp4.contiguous().view(torch.long),
+                w2_mxfp4.contiguous().view(torch.long),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                input_sf=x_mxfp8_sf,
+                use_mxfp8_act_scaling=True,
+                output=out,
+            )
+
+        input_args_for_bench = (
+            x_mxfp8,
+            selected_experts,
+            routing_weights,
+            w31_mxfp4,
+            w2_mxfp4,
+            x_mxfp8_sf,
+            out,
+        )
+    elif variant == "mxfp8_mxfp8":
+        # MXFP8 activations + MXFP8 weights
+        # Mirrors tests in flashinfer/tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_mxfp8_mxfp8
+        local_num_experts = w31_local.shape[0]
+        k = hidden_size
+        n_local = w2_local.shape[2]  # local intermediate size after TP
+
+        x_mxfp8, x_mxfp8_sf = mxfp8_quantize(x, True, 32)
+        input_acts = x_mxfp8
+        input_sf = x_mxfp8_sf
+
+        # Quantize weights to MXFP8 and compute block-scale factors (swizzled) for MXFPX.
+        # Quantize GEMM1 weights: [E, 2*n_local, k] by flattening to [-1, k]
+        mxfp8_w31, mxfp8_w31_sf = mxfp8_quantize(w31_local.view(-1, k), True, 32)
+        mxfp8_w31 = mxfp8_w31.view(local_num_experts, 2 * n_local, k)
+        mxfp8_w31_sf = mxfp8_w31_sf.view(torch.int32).view(local_num_experts, 2 * n_local, -1)
+
+        # Quantize GEMM2 weights: [E, k, n_local] by flattening to [-1, n_local]
+        mxfp8_w2, mxfp8_w2_sf = mxfp8_quantize(w2_local.view(-1, n_local), True, 32)
+        mxfp8_w2 = mxfp8_w2.view(local_num_experts, k, n_local)
+        mxfp8_w2_sf = mxfp8_w2_sf.view(torch.int32).view(local_num_experts, k, -1)
+
+        quant_scales = [
+            mxfp8_w31_sf,
+            mxfp8_w2_sf,
+        ]
+
+        def run_cutlass(
+            input_acts,
+            selected_experts,
+            routing_weights,
+            mxfp8_w31,
+            mxfp8_w2,
+            input_sf,
+            out,
+        ):
+            return cutlass_fused_moe(
+                input_acts,
+                selected_experts.to(torch.int),
+                routing_weights,
+                mxfp8_w31.contiguous(),
+                mxfp8_w2.contiguous(),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                input_sf=input_sf,
+                use_mxfp8_act_scaling=True,
+                output=out,
+            )
+
+        input_args_for_bench = (
+            input_acts,
+            selected_experts,
+            routing_weights,
+            mxfp8_w31,
+            mxfp8_w2,
+            input_sf,
+            out,
+        )
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
     backend = "cutlass"
+
+    # Optional reference check (correctness)
+    if getattr(args, "refcheck", False):
+        # Benchmark-style refcheck: compare against original (pre-quant) reference and gate on cosine similarity.
+        # This intentionally includes quantization error for quantized variants.
+        out.zero_()
+        run_cutlass(*input_args_for_bench)
+
+        local_num_experts = w31_local.shape[0]
+
+        # Note: when EP is enabled, `w31_local/w2_local` cover only a shard of experts.
+        # Remap global expert ids into local ids by subtracting `expert_start`.
+        selected_experts_local = selected_experts - expert_start
+        # If EP is enabled, some tokens may route to non-local experts. For a local-only reference,
+        # zero-out those contributions.
+        valid_mask = (selected_experts_local >= 0) & (selected_experts_local < local_num_experts)
+        routing_weights_local = routing_weights.clone()
+        routing_weights_local[~valid_mask] = 0.0
+        selected_experts_local = selected_experts_local.clone()
+        selected_experts_local[~valid_mask] = 0
+        ref_output = _compute_with_experts(
+            local_num_experts,
+            x,
+            w31_local,
+            w2_local,
+            selected_experts_local,
+            routing_weights_local,
+        )
+
+        if args.verbose >= 1:
+            diff = (out - ref_output).float()
+            abs_diff = diff.abs()
+            max_abs = abs_diff.max().item()
+            mean_abs = abs_diff.mean().item()
+            max_rel = (abs_diff / (ref_output.float().abs() + 1e-8)).max().item()
+            cos_sim = F.cosine_similarity(
+                ref_output.float().flatten(),
+                out.float().flatten(),
+                dim=0,
+                eps=1e-8,
+            ).item()
+            print(
+                "[REFCHECK] diff stats:"
+                f" max_abs={max_abs:.6g}"
+                f" mean_abs={mean_abs:.6g}"
+                f" max_rel={max_rel:.6g}"
+                f" cos_sim={cos_sim:.6f}"
+            )
+
+        # Prefer cosine similarity for quantized sanity checks.
+        # Use per-implementation thresholds since different quant modes have different expected error.
+        cos_sim_threshold_by_variant = {
+            # Unquantized path should be extremely close.
+            "base": 0.999,
+            # Per-tensor FP8 (includes quant error)
+            "fp8": 0.97,
+            # NVFP4 weights / optional input quant (more error)
+            "nvfp4": 0.90,
+            # MXFP8 activations + MXFP4 weights
+            "mxfp8_mxfp4": 0.90,
+            # MXFP8 activations + MXFP8 weights (wiring may be partial today)
+            "mxfp8_mxfp8": 0.90,
+        }
+        cos_sim_threshold = cos_sim_threshold_by_variant[variant]
+        cos_sim, cos_ok = is_close_cos_sim(ref_output, out, min_cos_sim=cos_sim_threshold)
+        if not cos_ok:
+            print(
+                "[ERROR] Refcheck cosine similarity below threshold: "
+                f"cos_sim={cos_sim:.6f} < {cos_sim_threshold}"
+            )
+            if not args.allow_output_mismatch:
+                raise AssertionError(
+                    "[ERROR] Refcheck failed (set --allow_output_mismatch to continue)."
+                )
 
     # Optional autotune warmup (supported for CUTLASS fused MoE)
     if getattr(args, "autotune", False):
@@ -1144,7 +1391,7 @@ def testCutlassFusedMoe(args):
         input_dtype,
         input_format=(
             "fp8"
-            if variant == "fp8"
+            if variant in ["fp8", "mxfp8_mxfp4"]
             else (
                 "fp4"
                 if (variant == "nvfp4" and getattr(args, "quantized_input", False))
@@ -1152,7 +1399,9 @@ def testCutlassFusedMoe(args):
             )
         ),
         weight_format=(
-            "fp8" if variant == "fp8" else ("fp4" if variant == "nvfp4" else None)
+            "fp8"
+            if variant == "fp8"
+            else ("fp4" if variant in ["nvfp4", "mxfp8_mxfp4"] else None)
         ),
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),

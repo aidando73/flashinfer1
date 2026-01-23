@@ -1297,6 +1297,9 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                   quant_params.fp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp4);
+  // MXFP8: FP8 activations + FP8 weights with block scaling
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                  quant_params.mxfp8);
 
   assert(gemm_m <= INT32_MAX);
   assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
@@ -1600,7 +1603,9 @@ void expandInputRowsKernelLauncher(
     else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                        std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
       TLLM_CHECK_WITH_INFO(!prequant_scales, "FP8 is not supported for AWQ");
-      return quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+      // Use MXFPX block scaling if either MXFP8_MXFP4 or MXFP8 mode
+      return (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+              quant_params.mxfp8.fc1.weight_block_scale)
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
@@ -2329,7 +2334,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                            "NVFP4 block scaling is expected for FP4xFP4");
       return fn(NVFP4);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return quant_params.mxfp8_mxfp4.fc2.weight_block_scale ? fn(MXFPX) : fn(NONE);
+      // Use MXFPX block scaling if either MXFP8_MXFP4 or MXFP8 mode
+      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+              quant_params.mxfp8.fc2.weight_block_scale) ? fn(MXFPX) : fn(NONE);
     } else
 #endif
     {
@@ -2526,17 +2533,17 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::CutlassMoeFCRunner()
+          bool IsMXFP8, class Enable>
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::CutlassMoeFCRunner()
     : blockscale_gemm_runner_{
           std::make_unique<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<
               __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()} {}
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 std::map<std::string, std::pair<size_t, size_t>>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
-                   Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows,
+                   IsMXFP8, Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows,
                                                           int64_t const hidden_size,
                                                           int64_t const inter_size,
                                                           int const num_experts_per_node,
@@ -2615,7 +2622,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
                                                 num_experts_per_node, getScalingType())
                                           : 0;
 
-  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  // Pass scaling type to get correct workspace size for MXFP8 vs per-tensor FP8
+  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, getScalingType());
 
   // lora related
   size_t const lora_input_size =
@@ -2710,9 +2718,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 size_t
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::getWorkspaceSize(
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::getWorkspaceSize(
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
     int const num_experts, int const experts_per_token, ActivationType activation_type,
     MOEParallelismConfig parallelism_config, bool use_lora, bool use_deepseek_fp8_block_scale,
@@ -2732,9 +2740,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
-                        Enable>::configureWsPtrs(char* ws_ptr, int64_t const num_rows,
+                        IsMXFP8, Enable>::configureWsPtrs(char* ws_ptr, int64_t const num_rows,
                                                  int64_t const hidden_size,
                                                  int64_t const inter_size,
                                                  int const num_experts_per_node,
@@ -2855,10 +2863,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface*
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
-                   Enable>::getDeepSeekBlockScaleGemmRunner() const {
+                   IsMXFP8, Enable>::getDeepSeekBlockScaleGemmRunner() const {
   TLLM_CHECK_WITH_INFO(
       (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<OutputType, __nv_bfloat16>),
       "Block scale GEMM runner only supports BF16 A/output");
@@ -2868,8 +2876,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::BlockScaleFC1(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, IsMXFP8, Enable>::BlockScaleFC1(
     DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input, T* const output,
     void* const gemm_output, int64_t const* const expert_first_token_offset,
     WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
@@ -2900,8 +2908,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::BlockScaleFC2(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, IsMXFP8, Enable>::BlockScaleFC2(
     DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input, void* const gemm_output,
     OutputType* const final_output, int64_t const* const expert_first_token_offset,
     WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
@@ -2931,9 +2939,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 T const*
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::applyPrequantScale(
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, IsMXFP8, Enable>::applyPrequantScale(
     void* smoothed_act, void const* permuted_data, void const* prequant_scales,
     int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len,
     bool const use_awq, cudaStream_t stream) {
@@ -2958,8 +2966,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm1(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::gemm1(
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, T* const output,
     void* const intermediate_result, int64_t const* const expert_first_token_offset,
@@ -3041,6 +3049,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                                                                 /*use_fused_moe*/ false,
                                                                 stream,
                                                                 config};
+
+    printf("using_tma_ws_gemm1...");
     gemm_runner.moeGemm(universal_input, tma_ws_input);
 
     sync_check_cuda_error(stream);
@@ -3061,6 +3071,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc2_fp4_act_flat, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
+
   } else if (use_fp8) {
     TLLM_CHECK(!use_ampere_activation_fusion);
     TLLM_CHECK(!config.is_tma_warp_specialized);
@@ -3089,6 +3100,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         /*use_fused_moe*/ false,
         stream,
         config};
+    printf("gemm1 occuring use_fp8...");
     gemm_runner.moeGemm(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
@@ -3131,6 +3143,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         /*use_fused_moe*/ false,
         stream,
         config};
+    printf("is_gated_activation...");
     gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     sync_check_cuda_error(stream);
@@ -3171,6 +3184,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         use_ampere_activation_fusion,
         stream,
         config};
+    printf("gemm1 occuring use_ampere_activation_fusion...");
     gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
     sync_check_cuda_error(stream);
@@ -3188,8 +3202,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm2(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::gemm2(
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
     void* const gemm_output, OutputType* const final_output,
@@ -3317,9 +3331,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
-                        Enable>::setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows,
+                        IsMXFP8, Enable>::setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows,
                                                     int64_t inter_size, int64_t hidden_size,
                                                     int start_expert, bool is_gated_activation,
                                                     int num_experts_per_node, bool needs_num_valid,
@@ -3411,8 +3425,8 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::loraFC1(
+          bool IsMXFP8, class Enable>
+auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::loraFC1(
     int64_t expanded_num_rows, int64_t inter_size, int64_t hidden_size, int num_experts_per_node,
     int start_expert, int64_t const* num_valid_tokens_ptr, bool is_gated_activation,
     ScaleBiasType const* fc1_expert_biases, LoraParams& lora_params, float const* input_fp8_dequant,
@@ -3490,8 +3504,8 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::loraFC2(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::loraFC2(
     int64_t inter_size, int64_t hidden_size, int num_experts_per_node, int start_expert,
     int64_t const* num_valid_tokens_ptr, int64_t num_tokens, LoraParams& lora_params,
     float const* fc2_fp8_quant, cudaStream_t stream) {
@@ -3531,8 +3545,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::runMoe(
+          bool IsMXFP8, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::runMoe(
     void const* input_activations_void, void const* input_sf_void, bool const swizzled_input_sf,
     int const* token_selected_experts, float const* token_final_scales,
     void const* fc1_expert_weights_void, void const* fc1_expert_biases_void,
@@ -3587,14 +3601,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
-  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale) {
+  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+      quant_params.mxfp8.fc1.weight_block_scale) {
     TLLM_CHECK_WITH_INFO(
         hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Hidden size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Hidden size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)hidden_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
     TLLM_CHECK_WITH_INFO(
         inter_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
-        "Inter size %d does not meet minimum alignment requirements for MXFP8_MXFP4 MOE GEMM %d",
+        "Inter size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",
         (int)inter_size, (int)(64 * 8 / sizeof_bits<WeightType>::value));
   } else {
     // For NoSmem epilogue schedule, we need to align the output of the GEMM to 256 bits, for gated
@@ -3652,15 +3667,27 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
         "FP8 scales are provided for integer quantization");
   } else if (fp8_scales_required && !use_deepseek_fp8_block_scale) {
-    TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
-                         "FP8 scales expected but dequant scale for FC1 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
-    TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
-                         "FP8 scales expected but quant scale for FC2 is a null pointer");
+    bool const is_mxfp8 = quant_params.mxfp8.fc1.weight_block_scale != nullptr;
+    if (is_mxfp8) {
+      TLLM_CHECK_WITH_INFO(quant_params.mxfp8.fc1.weight_block_scale != nullptr &&
+                               quant_params.mxfp8.fc2.weight_block_scale != nullptr,
+                           "MXFP8 scales expected but weight block scales are null");
+      TLLM_CHECK_WITH_INFO(
+          fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
+          "FP8 tensor scales are provided for MXFP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for MXFP8 quantization");
+    } else {
+      TLLM_CHECK_WITH_INFO(fc1_fp8_dequant != nullptr,
+                           "FP8 scales expected but dequant scale for FC1 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
+      TLLM_CHECK_WITH_INFO(fc2_fp8_dequant != nullptr,
+                           "FP8 scales expected but quant scale for FC2 is a null pointer");
 
-    TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
-                         "Integer scales are provided for FP8 quantization");
+      TLLM_CHECK_WITH_INFO(fc1_int_scales == nullptr && fc2_int_scales == nullptr,
+                           "Integer scales are provided for FP8 quantization");
+    }
   } else if (use_lora && use_fp8) {
     TLLM_CHECK_WITH_INFO(input_fp8_dequant != nullptr,
                          "FP8 scales expected but quant scale for input is a null pointer");
@@ -3797,6 +3824,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     sync_check_cuda_error(stream);
 
+    printf("setupTmaWarpSpecializedInputs occuring...");
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
@@ -3826,6 +3854,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
     }
     sync_check_cuda_error(stream);
+    printf("gemm1 occuring...");
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
                 glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
                 fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
@@ -3846,6 +3875,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
+    printf("gemm2 occuring...");
     Self::gemm2(
         moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
         expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
@@ -3860,9 +3890,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::
     computeStridesTmaWarpSpecialized(
         int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
         TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens,
@@ -3935,9 +3965,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::
     computeStridesTmaWarpSpecializedLowLatency(
         TmaWarpSpecializedGroupedGemmInput layout_info1,
         TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t gemm1_n,
@@ -3954,9 +3984,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
-          class Enable>
+          bool IsMXFP8, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFP8, Enable>::
     setupTmaWarpSpecializedInputs(int64_t num_rows, int64_t expanded_num_rows,
                                   ActivationParams fc1_activation_type, int64_t hidden_size,
                                   int64_t unpadded_hidden_size, int64_t inter_size,

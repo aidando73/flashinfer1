@@ -1,6 +1,11 @@
 import enum
+import logging
 import os
 from itertools import chain, product
+
+# Setup debug logging for kernel generation
+_logger = logging.getLogger(__name__)
+_DEBUG_KERNEL_GEN = os.environ.get("DEBUG_KERNEL_GEN", "0") == "1"
 
 from .cutlass_library import (
     enum_auto,
@@ -407,6 +412,35 @@ def is_gemm_op_valid_sm100(op):
         ):
             return False
 
+    # MXFP8 (block-scaled) has limited tile sizes on SM100:
+    # - TileShape_M must be 128
+    # - TileShape_N must be 64/128/192/256
+    if (
+        op.act_type == DataType.e4m3
+        and op.weight_type == DataType.e4m3
+        and op.is_mx_fpx
+    ):
+        print(
+            f"[MXFP8_DEBUG] arch={op.arch}, tile_m={tile_m}, tile_n={tile_n}, "
+            f"epi_schedule={op.epi_schedule}, is_mx_fpx={op.is_mx_fpx}",
+            flush=True,
+        )
+        if tile_n not in [64, 128, 256] or tile_m != 128:
+            print(
+                f"[MXFP8_DEBUG] REJECTED: tile constraint (tile_m={tile_m}, tile_n={tile_n})",
+                flush=True,
+            )
+            return False
+        # Block-scaled types on SM100 require TMA epilogue, NoSmem is not supported
+        # Filter out both NoSmem variants
+        if op.arch == 100 and op.epi_schedule in [
+            EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized,
+            EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm,
+        ]:
+            print("[MXFP8_DEBUG] REJECTED: NoSmem epilogue on SM100", flush=True)
+            return False
+        print(f"[MXFP8_DEBUG] ACCEPTED: tile_m={tile_m}, tile_n={tile_n}", flush=True)
+
     # Shapes for fp8 small N shapes
     if (
         (op.act_type == DataType.e4m3)
@@ -479,7 +513,9 @@ def is_op_valid(op):
 
 
 ################################################################################
-def generate_sm90_mixed_gemm_operations():
+def generate_sm90_mixed_gemm_operations(is_arch_enabled):
+    if not is_arch_enabled:
+        return []
     arch = 90
 
     # For legacy reasons, we use unsigned types for the weights. The instanitated template
@@ -728,7 +764,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
 
 def generate_sm90_operations(is_arch_enabled):
-    operations = generate_sm90_mixed_gemm_operations()
+    operations = generate_sm90_mixed_gemm_operations(is_arch_enabled)
     operations.extend(generate_sm90_grouped_gemm_operations(is_arch_enabled))
     operations.extend(generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled))
     return operations
@@ -914,30 +950,42 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                weight_type,
-                otype,
-                otype,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
-                dynamic_cga=dynamic_cga,
-                swap_ab=swap_ab,
-            )
+            # Determine which is_mx_fpx variants to generate:
+            # - WFP4AFP8 (FP8@FP4): only is_mx_fpx=True
+            # - WFP8@AFP8 (FP8@FP8): both False (per-tensor) and True (block-scaled)
+            # - Others: only is_mx_fpx=False
+            if dtype == DataType.e4m3 and weight_type == e2m1:
+                mx_fpx_variants = [True]
+            elif dtype == DataType.e4m3 and weight_type == DataType.e4m3:
+                mx_fpx_variants = [False, True]  # Both per-tensor and block-scaled
+            else:
+                mx_fpx_variants = [False]
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+            for is_mx_fpx in mx_fpx_variants:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    weight_type,
+                    otype,
+                    otype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    is_mx_fpx=is_mx_fpx,
+                    dynamic_cga=dynamic_cga,
+                    swap_ab=swap_ab,
+                )
+
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 
@@ -994,7 +1042,61 @@ def generate_sm80_operations(is_arch_enabled):
     return operations
 
 
-def generate_gemm_operations(output_dir, architectures):
+def _parse_dtype_filter(dtype_filter: str | None):
+    """Parse a comma-separated filter for (act_type, weight_type) pairs.
+
+    Examples:
+      - None / "" / "all": no filtering
+      - "bf16_bf16"
+      - "bf16_fp8,fp16_fp16"
+      - "fp8_fp4"
+
+    Notes:
+      - Supports common aliases: fp16/f16, bf16, fp32/f32, fp8/e4m3, fp4/e2m1, uint4/u4, uint8/u8.
+      - "fp4" matches both `DataType.e2m1` and the legacy `e2m1` sentinel used in some configs.
+    """
+    if not dtype_filter:
+        return None
+    tokens = [t.strip() for t in dtype_filter.split(",") if t.strip()]
+    if not tokens or any(t.lower() == "all" for t in tokens):
+        return None
+
+    def _type_set(name: str):
+        n = name.strip().lower()
+        if n in ("bf16", "bfloat16"):
+            return {DataType.bf16}
+        if n in ("fp16", "f16", "half"):
+            return {DataType.f16}
+        if n in ("fp32", "f32", "float"):
+            return {DataType.f32}
+        if n in ("fp8", "e4m3"):
+            return {DataType.e4m3}
+        if n in ("fp4", "e2m1"):
+            return {DataType.e2m1, e2m1}
+        if n in ("uint4", "u4"):
+            return {DataType.u4}
+        if n in ("uint8", "u8"):
+            return {DataType.u8}
+        if n in ("ue8m0",):
+            return {DataType.ue8m0}
+        raise ValueError(f"Unknown dtype token in dtype_filter: {name!r}")
+
+    allowed_pairs = set()
+    for tok in tokens:
+        if "_" not in tok:
+            # Shorthand: "bf16" means "bf16_bf16"
+            a = b = tok
+        else:
+            a, b = tok.split("_", 1)
+        for ta in _type_set(a):
+            for tb in _type_set(b):
+                allowed_pairs.add((ta, tb))
+    return allowed_pairs
+
+
+def generate_gemm_operations(
+    output_dir, architectures, dtype_filter: str | None = None
+):
     arches = architectures.split(";")
     # Get the absolute path of the provided directory
     output_dir = os.path.abspath(output_dir)
@@ -1032,6 +1134,54 @@ def generate_gemm_operations(output_dir, architectures):
     operations += generate_sm100_operations(has_arch(100) or has_arch(103))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
+
+    allowed_pairs = _parse_dtype_filter(dtype_filter)
+    if allowed_pairs is not None:
+        filtered = []
+
+        for op in operations:
+            # SM80 launcher config uses a single `dtype`.
+            if isinstance(op, GemmSm80LauncherConfig):
+                if (op.dtype, op.dtype) in allowed_pairs:
+                    filtered.append(op)
+                continue
+
+            # TRT-LLM style operations carry `act_type`/`weight_type`.
+            act = getattr(op, "act_type", None)
+            weight = getattr(op, "weight_type", None)
+            if act is None or weight is None:
+                filtered.append(op)
+                continue
+
+            if (act, weight) in allowed_pairs:
+                filtered.append(op)
+
+        operations = filtered
+
+    # FAST_BUILD: filter to only 128x128 CTA shapes to match C++ FAST_BUILD guards
+    use_fast_build = os.environ.get("FLASHINFER_FAST_BUILD", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_fast_build:
+        filtered = []
+        for op in operations:
+            if isinstance(op, GemmSm80LauncherConfig):
+                # SM80 doesn't use the same CTA shape filtering
+                filtered.append(op)
+                continue
+
+            cta_shape = getattr(op, "cta_shape", None)
+            if cta_shape is None:
+                filtered.append(op)
+                continue
+
+            # FAST_BUILD only supports 128x128xK CTA shapes
+            if cta_shape[0] == 128 and cta_shape[1] == 128:
+                filtered.append(op)
+
+        operations = filtered
 
     def should_skip(op):
         return False  # All kernels have a public implementation

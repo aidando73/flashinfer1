@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -50,6 +51,10 @@ from ..utils import (
     register_fake_op,
     get_compute_capability,
 )
+# Check for FLASHINFER_FAST_BUILD env var to enable fast build mode
+# This limits CTA tile shapes to reduce compilation time
+_USE_FAST_BUILD = os.environ.get("FLASHINFER_FAST_BUILD", "0").lower() in ("1", "true", "yes")
+
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
@@ -781,6 +786,10 @@ def cutlass_fused_moe(
             - gemm2 dequant scale
             - gemm1 input dequant scale
 
+        MXFP8_MXFP8 (use_mxfp8_act_scaling=True):
+            - gemm1 weights block scales (int32 view of packed scale tensor)
+            - gemm2 weights block scales (int32 view of packed scale tensor)
+
     fc1_expert_biases : Optional[torch.Tensor]
         GEMM1 biases for each expert.
 
@@ -895,7 +904,7 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+    return get_cutlass_fused_moe_module(device_arch, _USE_FAST_BUILD).cutlass_fused_moe(
         output,
         input,
         token_selected_experts,

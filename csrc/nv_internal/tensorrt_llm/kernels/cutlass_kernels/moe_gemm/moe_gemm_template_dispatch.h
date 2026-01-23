@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <cstdio>
+
 // Ignore CUTLASS warnings about type punning
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
@@ -590,9 +592,22 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
       (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
       use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
+  // MXFP8 (block-scaled FP8) requires M=128 tile shapes on SM100
+  static constexpr auto mxfp8_only_flag =
+      is_mxfp8 ? CutlassGemmConfig::MXFP8_ONLY : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper |
-      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
+      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag | mxfp8_only_flag);
+
+  // DEBUG: Log config flags for diagnosis
+  printf(
+      "[MOE_GEMM_DEBUG] getTmaWarpSpecializedConfigs: sm=%d, use_fp8=%d, is_mxfp8=%d, "
+      "use_fp4=%d, use_wfp4afp8=%d, fp8_only_flag=0x%x, fp4_only_flag=0x%x, "
+      "mxfp8_only_flag=0x%x, config_type_param=0x%x\n",
+      sm, (int)use_fp8, (int)is_mxfp8, (int)use_fp4, (int)use_wfp4afp8, (int)fp8_only_flag,
+      (int)fp4_only_flag, (int)mxfp8_only_flag, (int)config_type_param);
+  fflush(stdout);
+
   TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper),
                        "Blackwell and hopper flags are mutually exclusive");
 
@@ -808,13 +823,16 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             "Calling TMA warp specialized configuration with invalid hopper config");
 
         // Select the appropriate fusion function
+        printf("dispatching to sm >= 90...");
         auto select_function = [&]() {
           switch (hopper_inputs.fusion) {
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
+              printf("dispatching to sm >= 90... FINALIZE");
               return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<
                   T, WeightType, OutputType, EpilogueTag,
                   TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE>;
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE:
+              printf("dispatching to sm >= 90... NONE");
               return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<
                   T, WeightType, OutputType, EpilogueTag,
                   TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
@@ -902,18 +920,34 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
     int num_experts) const {
-  if (num_experts != num_experts_) {
-    TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts,
-                   num_experts_);
-    num_experts_ = num_experts;
-    gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts);
+  // Default: use type-based scaling type determination
+  return getMaxWorkspaceSize(num_experts, getDefaultScalingType());
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
+    int num_experts, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) const {
+  // Use a simple cache key that includes both num_experts and scaling_type
+  // For now, just recalculate each time when scaling_type is provided explicitly
+  return calcMaxWorkspaceSize(num_experts, scaling_type);
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getDefaultScalingType() const {
+  if constexpr (use_wfp4afp8) {
+    return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+  } else if constexpr (use_fp4) {
+    return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+  } else {
+    return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }
-  return gemm_workspace_size_;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
-    int num_experts) const {
+    int num_experts,
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType fpX_block_scaling_type) const {
   if constexpr (use_w4_groupwise) {
     return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
                                                                                  OutputType>(
@@ -928,12 +962,6 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     // Finalize fusion may not actually be supported by the kernel,
     // if they are not we will catch the error and skip them
     auto configs = getTmaWarpSpecializedConfigs(sm_, true);
-    auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
-    if constexpr (use_wfp4afp8) {
-      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if (use_fp4) {
-      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-    }
     size_t max_size = 0;
     bool has_config = false;
     for (auto conf : configs) {
@@ -966,6 +994,13 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         "Attempting to calculate Hopper GEMM workspace size with unsupported weight combination");
     return 0;
   }
+}
+
+// Keep the old signature for backward compatibility
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
+    int num_experts) const {
+  return calcMaxWorkspaceSize(num_experts, getDefaultScalingType());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

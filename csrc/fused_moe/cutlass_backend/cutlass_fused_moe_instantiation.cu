@@ -30,14 +30,19 @@ template class CutlassMoeFCRunner<half, half>;
 template class CutlassMoeFCRunner<half, uint8_t>;
 template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 #ifdef ENABLE_FP8
-// template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3>;
+// Per-tensor FP8 (IsMXFP8=false, the default)
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>;
+// MXFP8 block-scaled FP8 (IsMXFP8=true)
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half, __nv_fp8_e4m3, half, true>;
 #ifdef ENABLE_BF16
+// Per-tensor FP8 (IsMXFP8=false, the default)
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>;
+// MXFP8 block-scaled FP8 (IsMXFP8=true)
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16, true>;
 #endif
 #endif
 #ifdef ENABLE_FP4
