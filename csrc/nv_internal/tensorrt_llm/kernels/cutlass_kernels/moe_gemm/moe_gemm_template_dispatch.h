@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <cstdio>
+
 // Ignore CUTLASS warnings about type punning
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
@@ -590,9 +592,22 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
       (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
       use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
+  // MXFP8 (block-scaled FP8) requires M=128 tile shapes on SM100
+  static constexpr auto mxfp8_only_flag =
+      is_mxfp8 ? CutlassGemmConfig::MXFP8_ONLY : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper |
-      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
+      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag | mxfp8_only_flag);
+
+  // DEBUG: Log config flags for diagnosis
+  printf(
+      "[MOE_GEMM_DEBUG] getTmaWarpSpecializedConfigs: sm=%d, use_fp8=%d, is_mxfp8=%d, "
+      "use_fp4=%d, use_wfp4afp8=%d, fp8_only_flag=0x%x, fp4_only_flag=0x%x, "
+      "mxfp8_only_flag=0x%x, config_type_param=0x%x\n",
+      sm, (int)use_fp8, (int)is_mxfp8, (int)use_fp4, (int)use_wfp4afp8, (int)fp8_only_flag,
+      (int)fp4_only_flag, (int)mxfp8_only_flag, (int)config_type_param);
+  fflush(stdout);
+
   TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper),
                        "Blackwell and hopper flags are mutually exclusive");
 
@@ -931,7 +946,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getDefaultScalingType()
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
-    int num_experts, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType fpX_block_scaling_type) const {
+    int num_experts,
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType fpX_block_scaling_type) const {
   if constexpr (use_w4_groupwise) {
     return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
                                                                                  OutputType>(

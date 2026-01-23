@@ -16,6 +16,8 @@
 
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 
+#include <cstdio>
+
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
@@ -272,10 +274,31 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
   bool supports_2sm = dynamic_cluster_shape == ClusterShape::Undefined ||
                       std::get<0>(enum_to_shape_tuple(dynamic_cluster_shape)) % 2 == 0;
 
+  // FP4 requires M=128 tile shapes on SM100
+  // Note: MXFP8 (block-scaled FP8) also requires M=128, but this is checked at runtime
+  // since we can't distinguish per-tensor FP8 (which allows M=64) from block-scaled MXFP8
+  // at compile time when both use the same types (__nv_fp8_e4m3 x __nv_fp8_e4m3)
+  bool const requires_m128_tiles = (config & CutlassGemmConfig::FP4_ONLY) != 0;
+
+  // DEBUG: Log heuristic decisions
+  printf(
+      "[MOE_GEMM_DEBUG] get_candidate_configs_sm100_dynamic_cluster_shape: sm=%d, "
+      "config=0x%x, FP4_ONLY=%d, MXFP8_ONLY=%d, requires_m128_tiles=%d, schedule=%d\n",
+      sm, (int)config, (int)((config & CutlassGemmConfig::FP4_ONLY) != 0),
+      (int)((config & CutlassGemmConfig::MXFP8_ONLY) != 0), (int)requires_m128_tiles,
+      (int)schedule);
+  fflush(stdout);
+
   std::vector<CutlassGemmConfig> candidate_configs;
-  if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
+  if (requires_m128_tiles) {
+    printf("[MOE_GEMM_DEBUG] requires_m128_tiles=true, returning only M=128 tile configs\n");
+    fflush(stdout);
     if (sm == 100) {
-      if (schedule != EpilogueScheduleType::TMA) return {};
+      if (schedule != EpilogueScheduleType::TMA) {
+        printf("[MOE_GEMM_DEBUG] schedule != TMA, returning empty config list\n");
+        fflush(stdout);
+        return {};
+      }
       candidate_configs.push_back(CutlassGemmConfig{
           CutlassTileConfigSM100::CtaShape128x64x128B, MainloopScheduleType::AUTO, schedule,
           cluster1sm, dynamic_cluster_shape, fallback_cluster_shape, sm});
@@ -300,6 +323,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
           CutlassTileConfigSM100::CtaShape128x256x128B, MainloopScheduleType::AUTO, schedule,
           cluster2sm, dynamic_cluster_shape, fallback_cluster_shape, sm});
     }
+    printf("[MOE_GEMM_DEBUG] returning %zu configs for M=128 tiles\n", candidate_configs.size());
+    fflush(stdout);
     return candidate_configs;
   }
 

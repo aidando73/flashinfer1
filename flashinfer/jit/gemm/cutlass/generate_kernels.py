@@ -1,6 +1,11 @@
 import enum
+import logging
 import os
 from itertools import chain, product
+
+# Setup debug logging for kernel generation
+_logger = logging.getLogger(__name__)
+_DEBUG_KERNEL_GEN = os.environ.get("DEBUG_KERNEL_GEN", "0") == "1"
 
 from .cutlass_library import (
     enum_auto,
@@ -406,6 +411,35 @@ def is_gemm_op_valid_sm100(op):
             and op.epi_schedule == EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm
         ):
             return False
+
+    # MXFP8 (block-scaled) has limited tile sizes on SM100:
+    # - TileShape_M must be 128
+    # - TileShape_N must be 64/128/192/256
+    if (
+        op.act_type == DataType.e4m3
+        and op.weight_type == DataType.e4m3
+        and op.is_mx_fpx
+    ):
+        print(
+            f"[MXFP8_DEBUG] arch={op.arch}, tile_m={tile_m}, tile_n={tile_n}, "
+            f"epi_schedule={op.epi_schedule}, is_mx_fpx={op.is_mx_fpx}",
+            flush=True,
+        )
+        if tile_n not in [64, 128, 256] or tile_m != 128:
+            print(
+                f"[MXFP8_DEBUG] REJECTED: tile constraint (tile_m={tile_m}, tile_n={tile_n})",
+                flush=True,
+            )
+            return False
+        # Block-scaled types on SM100 require TMA epilogue, NoSmem is not supported
+        # Filter out both NoSmem variants
+        if op.arch == 100 and op.epi_schedule in [
+            EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized,
+            EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm,
+        ]:
+            print("[MXFP8_DEBUG] REJECTED: NoSmem epilogue on SM100", flush=True)
+            return False
+        print(f"[MXFP8_DEBUG] ACCEPTED: tile_m={tile_m}, tile_n={tile_n}", flush=True)
 
     # Shapes for fp8 small N shapes
     if (
@@ -924,7 +958,6 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
                 mx_fpx_variants = [True]
             elif dtype == DataType.e4m3 and weight_type == DataType.e4m3:
                 mx_fpx_variants = [False, True]  # Both per-tensor and block-scaled
-                # mx_fpx_variants = [True] # TODO - this is just for development purposes to reduce compile time - should uncomment the above when ready
             else:
                 mx_fpx_variants = [False]
 
@@ -1061,7 +1094,9 @@ def _parse_dtype_filter(dtype_filter: str | None):
     return allowed_pairs
 
 
-def generate_gemm_operations(output_dir, architectures, dtype_filter: str | None = None):
+def generate_gemm_operations(
+    output_dir, architectures, dtype_filter: str | None = None
+):
     arches = architectures.split(";")
     # Get the absolute path of the provided directory
     output_dir = os.path.abspath(output_dir)
@@ -1124,7 +1159,11 @@ def generate_gemm_operations(output_dir, architectures, dtype_filter: str | None
         operations = filtered
 
     # FAST_BUILD: filter to only 128x128 CTA shapes to match C++ FAST_BUILD guards
-    use_fast_build = os.environ.get("FLASHINFER_FAST_BUILD", "0").lower() in ("1", "true", "yes")
+    use_fast_build = os.environ.get("FLASHINFER_FAST_BUILD", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     if use_fast_build:
         filtered = []
         for op in operations:
